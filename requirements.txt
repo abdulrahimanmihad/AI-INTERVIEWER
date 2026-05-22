@@ -1,0 +1,48 @@
+#  Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+
+#  STT (local Whisper — free) 
+openai-whisper==20231117
+torch==2.5.0
+numpy==1.26.4
+soundfile==0.12.1
+
+#  VAD (Windows-friendly prebuilt wheel) 
+webrtcvad-wheels==2.0.14
+
+#  LLM providers 
+# OpenAI client (also used for Groq — same API shape)
+openai==1.54.0
+
+# Groq doesn't need its own SDK — uses openai client with different base_url
+
+# AWS Bedrock (only loads if LLM_PROVIDER=bedrock)
+boto3==1.35.55
+
+#  State storage
+redis==5.2.0
+
+# PostgreSQL + SQLite via SQLAlchemy 2.0 async
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.30.0          # PostgreSQL async driver
+aiosqlite==0.20.0        # SQLite async driver (fallback for local dev)
+
+#  RAG: LangChain + LangGraph + Chroma 
+langchain==0.3.7
+langchain-community==0.3.5
+langchain-openai==0.2.5
+langchain-text-splitters==0.3.2
+chromadb==0.5.18
+langgraph==0.2.45
+
+# Local embeddings (free — for EMBEDDING_PROVIDER=local)
+sentence-transformers==3.2.1
+
+#  Observability 
+mlflow==2.17.2
+langsmith==0.1.142   # auto-traces when LANGSMITH_API_KEY is set
+
+#  Env vars 
+python-dotenv==1.0.1

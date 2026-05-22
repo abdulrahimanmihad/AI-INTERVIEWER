@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Interviewer — Demo</title>
+<!--
+═══════════════════════════════════════════════════════════════════════
+FRONTEND with browser speech (FREE — no API needed)
+
+KEY DIFFERENCE FROM OPENAI TTS VERSION:
+    When backend sends {"type": "SPEAK", "text": "..."}
+    Browser uses window.speechSynthesis to speak it
+    Zero API calls, zero cost, works offline
+
+WHY THIS IS FINE FOR DEMO:
+    Modern browser voices (Chrome, Safari) sound very good
+    The interview is in English which has the best voice support
+    No API quota issues if many people try the demo
+═══════════════════════════════════════════════════════════════════════
+-->
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .card {
+    background: #1e293b;
+    border-radius: 16px;
+    padding: 32px;
+    width: 100%;
+    max-width: 600px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+  }
+  h1 { font-size: 24px; margin-bottom: 8px; color: #f1f5f9; }
+  .subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 24px; }
+
+  .field { margin-bottom: 16px; }
+  label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }
+  input {
+    width: 100%;
+    padding: 10px 14px;
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+  input:focus { outline: none; border-color: #3b82f6; }
+
+  button {
+    width: 100%;
+    padding: 12px;
+    background: #3b82f6;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+    cursor: pointer;
+    margin-top: 8px;
+  }
+  button:hover:not(:disabled) { background: #2563eb; }
+  button:disabled { background: #475569; cursor: not-allowed; }
+  button.danger { background: #dc2626; }
+
+  .status {
+    margin-top: 16px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    background: #0f172a;
+    border: 1px solid #334155;
+  }
+  .status.transcribing { background: #1e3a8a; border-color: #3b82f6; }
+  .status.settling { background: #422006; border-color: #f59e0b; }
+  .status.thinking { background: #1e3a8a; border-color: #3b82f6; }
+  .status.speaking { background: #14532d; border-color: #22c55e; }
+  .status.listening { background: #450a0a; border-color: #dc2626; }
+
+  /* ADDED: timer styles — big countdown shown above status */
+  .timer {
+    font-size: 28px;
+    font-weight: 600;
+    text-align: center;
+    color: #34d399;
+    font-family: -apple-system, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: 2px;
+    padding: 12px;
+    background: #0f172a;
+    border-radius: 8px;
+    border: 1px solid #334155;
+  }
+  .timer.warning { color: #fbbf24; border-color: #f59e0b; }
+  .timer.critical { color: #f87171; border-color: #dc2626; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+  .transcript {
+    margin-top: 16px;
+    padding: 12px 16px;
+    background: #0f172a;
+    border-left: 3px solid #64748b;
+    border-radius: 4px;
+    font-size: 14px;
+    line-height: 1.6;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .turn { margin-bottom: 12px; }
+  .turn .role { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .turn.user .role { color: #60a5fa; }
+  .turn.ai .role { color: #34d399; }
+
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>AI Interviewer</h1>
+  <p class="subtitle">Voice interview with Sarah, your AI recruiter</p>
+
+  <div id="form-section">
+    <div class="field">
+      <label>Your name</label>
+      <input id="name" type="text" placeholder="John Smith" />
+    </div>
+    <div class="field">
+      <label>Your email</label>
+      <input id="email" type="email" placeholder="john@example.com" />
+    </div>
+    <button id="start-btn">Start Interview</button>
+  </div>
+
+  <div id="interview-section" class="hidden">
+    <!-- ADDED: live timer countdown display -->
+    <div id="timer" class="timer">10:00</div>
+    <div id="status" class="status">Connecting...</div>
+    <div id="transcript" class="transcript"></div>
+    <button id="stop-btn" class="danger hidden">End Interview</button>
+  </div>
+</div>
+
+<script>
+/*
+═══════════════════════════════════════════════════════════════════════
+FRONTEND LOGIC
+═══════════════════════════════════════════════════════════════════════
+
+Connection flow:
+    1. User clicks Start → fill form fields
+    2. We open WebSocket → backend
+    3. Set up mic capture at 16kHz PCM → send to backend
+    4. Receive messages:
+       - SPEAK: browser speaks the text using SpeechSynthesis
+       - TRANSCRIPT: show what we said
+       - AI_REPLY: show what AI said
+       - STATUS: update status indicator
+═══════════════════════════════════════════════════════════════════════
+*/
+
+// DOM elements
+const formSection      = document.getElementById('form-section');
+const interviewSection = document.getElementById('interview-section');
+const nameInput        = document.getElementById('name');
+const emailInput       = document.getElementById('email');
+const startBtn         = document.getElementById('start-btn');
+const stopBtn          = document.getElementById('stop-btn');
+const statusEl         = document.getElementById('status');
+const transcriptEl     = document.getElementById('transcript');
+const timerEl          = document.getElementById('timer');   // ← ADDED
+
+// State
+let socket       = null;
+let audioContext = null;
+let mediaStream  = null;
+let workletNode  = null;
+let selectedVoice = null;
+
+// ADDED: track what Sarah is currently saying so we can send "spoken_so_far"
+// on interrupt — backend needs this to know what was cut off
+let currentUtterance = null;
+let currentSpokenText = "";
+let isUserSpeaking = false;
+let speechFrameCount = 0;
+
+// ─── ISSUE #1 FIX: TICKING TIMER STATE ───────────────────────────
+// localRemainingSecs is the client's local estimate of time left.
+// Backend sends TIMER_TICK every second — that's the source of truth.
+// Between ticks, our local setInterval decrements localRemainingSecs
+// once per second so the UI feels alive even with network jitter.
+//
+// WHY ANCHORING (not just running a local timer):
+//   - Pure local timer drifts (CPU throttle, sleep, etc.)
+//   - Backend ticks correct any drift every second
+//   - Result: UI ticks smoothly AND stays accurate
+let localRemainingSecs = 0;
+let timerIntervalId    = null;
+let timerRunning       = false;
+
+// ─── BUG 1 FIX: status reset timer ──────────────────────────────
+// Used to auto-revert stuck "listening" status back to idle
+// if no real transcription follows within 2.5 seconds.
+let statusResetTimer = null;
+
+// Track current pipeline status as a variable — DOM className isn't reliable
+// because setStatus doesn't update the DOM synchronously for our check.
+let currentStatus = '';
+
+// ─── INIT BROWSER VOICES ──────────────────────────────────────────
+// Pick a natural-sounding English voice when available
+function initVoices() {
+  const voices = window.speechSynthesis.getVoices();
+  // Prefer high-quality English voices in this priority
+  const preferred = [
+    'Google US English', 'Microsoft Aria', 'Microsoft Jenny',
+    'Samantha', 'Karen', 'Daniel'
+  ];
+  for (const name of preferred) {
+    const voice = voices.find(v => v.name.includes(name));
+    if (voice) { selectedVoice = voice; return; }
+  }
+  selectedVoice = voices.find(v => v.lang.startsWith('en')) || voices[0];
+}
+window.speechSynthesis.onvoiceschanged = initVoices;
+initVoices();
+
+// ─── SPEAK USING BROWSER ──────────────────────────────────────────
+// This replaces the OpenAI TTS audio streaming
+// Zero API calls — uses the user's OS speech engine
+function speak(text) {
+  if (!text) return;
+
+  setStatus('Sarah is speaking...', 'speaking');
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  if (selectedVoice) utterance.voice = selectedVoice;
+  utterance.rate   = 1.0;
+  utterance.pitch  = 1.0;
+  utterance.volume = 1.0;
+
+  // ADDED: track what's been spoken so far for the INTERRUPT message
+  // onboundary fires at each word — we update currentSpokenText so if the
+  // user interrupts, we know which words Sarah had already said
+  currentSpokenText = "";
+  utterance.onboundary = (event) => {
+    if (event.name === 'word') {
+      currentSpokenText = text.substring(0, event.charIndex + event.charLength);
+    }
+  };
+
+  utterance.onstart = () => {
+    currentUtterance = utterance;
+  };
+
+  utterance.onend = () => {
+    currentUtterance = null;
+    currentSpokenText = "";
+    setStatus('Your turn — speak now', 'listening');
+
+    // ── ISSUE #3 FIX: notify backend that TTS finished ──
+    // Backend will release the AI_SPEAKING lock and resume listening
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "TTS_DONE" }));
+    }
+  };
+
+  utterance.onerror = () => {
+    currentUtterance = null;
+    currentSpokenText = "";
+    // Also release lock on error so we don't deadlock
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "TTS_DONE" }));
+    }
+  };
+
+  // Cancel anything currently speaking, then speak the new one
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+}
+
+// ─── ADDED: STOP TTS PLAYBACK (called when backend confirms interrupt) ──
+function stopSpeaking() {
+  window.speechSynthesis.cancel();
+  currentUtterance = null;
+  currentSpokenText = "";
+}
+
+// ─── UI HELPERS ───────────────────────────────────────────────────
+function setStatus(text, type = '') {
+  statusEl.textContent = text;
+  statusEl.className = 'status ' + type;
+}
+
+function addTurn(role, text) {
+  const div = document.createElement('div');
+  div.className = 'turn ' + role;
+  div.innerHTML = `<div class="role">${role === 'user' ? 'You' : 'Sarah'}</div><div>${text}</div>`;
+  transcriptEl.appendChild(div);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+// ─── ISSUE #1 FIX: TIMER RENDERING + LOCAL TICK ──────────────────
+// Renders the MM:SS display and applies color classes based on remaining time
+function renderTimer(secs) {
+  if (secs < 0) secs = 0;
+  const mins = Math.floor(secs / 60);
+  const s    = secs % 60;
+  timerEl.textContent = `${String(mins).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+
+  // Color states
+  if (secs <= 30) {
+    timerEl.className = 'timer critical';
+  } else if (secs <= 60) {
+    timerEl.className = 'timer warning';
+  } else {
+    timerEl.className = 'timer';
+  }
+}
+
+// Start the client-side tick — decrements localRemainingSecs every second
+// Backend TIMER_TICK messages will RE-SYNC this value every second too,
+// so any drift gets corrected immediately. setInterval is safe here
+// because we're not in React — no re-render cascade risk.
+function startLocalTimer() {
+  if (timerIntervalId) return;  // already running
+  timerRunning = true;
+  timerIntervalId = setInterval(() => {
+    if (localRemainingSecs > 0) {
+      localRemainingSecs -= 1;
+      renderTimer(localRemainingSecs);
+    } else {
+      stopLocalTimer();
+    }
+  }, 1000);
+}
+
+function stopLocalTimer() {
+  if (timerIntervalId) {
+    clearInterval(timerIntervalId);
+    timerIntervalId = null;
+  }
+  timerRunning = false;
+}
+
+// ─── START ────────────────────────────────────────────────────────
+startBtn.addEventListener('click', async () => {
+  const name  = nameInput.value.trim();
+  const email = emailInput.value.trim();
+
+  if (!email) { alert('Please enter your email'); return; }
+
+  formSection.classList.add('hidden');
+  interviewSection.classList.remove('hidden');
+  stopBtn.classList.remove('hidden');
+
+  setStatus('Connecting...');
+  try {
+    await connectAndStart(name, email);
+  } catch (err) {
+    setStatus('Error: ' + err.message);
+    console.error(err);
+  }
+});
+
+stopBtn.addEventListener('click', () => {
+  if (socket) socket.close();
+  if (workletNode) workletNode.disconnect();
+  if (audioContext) audioContext.close();
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  window.speechSynthesis.cancel();
+  stopLocalTimer();   // ← ADDED: stop the ticking clock
+  setStatus('Interview ended');
+  stopBtn.classList.add('hidden');
+});
+
+// ─── WEBSOCKET ────────────────────────────────────────────────────
+async function connectAndStart(name, email) {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${protocol}//${window.location.host}/ws?name=${encodeURIComponent(name)}&email=${encodeURIComponent(email)}`;
+  socket = new WebSocket(wsUrl);
+
+  socket.onopen = async () => {
+    setStatus('Connected — preparing mic...');
+    await setupAudio();
+  };
+
+  socket.onmessage = (event) => {
+    handleMessage(JSON.parse(event.data));
+  };
+
+  socket.onclose = () => {
+    setStatus('Disconnected');
+    stopBtn.classList.add('hidden');
+  };
+
+  socket.onerror = (err) => {
+    console.error('WebSocket error:', err);
+    setStatus('Connection error');
+  };
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    // ─── STATUS handling — show each pipeline state clearly ──────
+    case 'STATUS':
+      const STATUS_LABELS = {
+        'listening':    'Listening...',
+        'transcribing': 'Transcribing...',
+        'settling':     'Go on, or pause to finish...',
+        'thinking':     'Sarah is thinking...',
+        'speaking':     'Sarah is speaking...',
+      };
+      const incomingLabel = STATUS_LABELS[msg.message] || msg.message;
+
+      // Clear any pending status transition
+      if (statusResetTimer) {
+        clearTimeout(statusResetTimer);
+        statusResetTimer = null;
+      }
+
+      // BUG FIX: track status with a VARIABLE not the DOM class.
+      // The DOM doesn't update synchronously — checking className
+      // right after setStatus() doesn't reflect the new state.
+      // Backend can send transcribing → thinking within 50ms, so
+      // we need to know what was JUST set, not what the DOM shows.
+      const wasTranscribing = (currentStatus === 'transcribing');
+      currentStatus = msg.message;   // track for next event
+
+      if (wasTranscribing && msg.message === 'thinking') {
+        // Hold transcribing visible for 800ms so user actually sees it
+      } else {
+        setStatus(incomingLabel, msg.message);
+      }
+      break;
+    case 'TRANSCRIPT':
+      addTurn('user', msg.text);
+      break;
+    case 'AI_REPLY':
+      addTurn('ai', msg.text);
+      break;
+    case 'SPEAK':
+      speak(msg.text);
+      break;
+    case 'RESUME':
+      addTurn('ai', msg.message);
+      setStatus(msg.message, 'speaking');
+      break;
+    // ─── ISSUE #1 FIX: backend tick is source of truth, syncs our local timer ───
+    case 'TIMER_TICK':
+      // Update local state from backend (corrects any drift)
+      localRemainingSecs = msg.remaining;
+      renderTimer(localRemainingSecs);
+
+      // Start the local tick loop if not already running
+      if (!timerRunning) {
+        startLocalTimer();
+      }
+      break;
+    // ADDED: 1-minute warning before interview ends
+    case 'TIMER_WARNING':
+      setStatus('1 minute remaining...', 'thinking');
+      break;
+    case 'STOP_SPEAKING':
+      stopSpeaking();
+      setStatus('Listening...', 'listening');
+      break;
+    case 'ERROR':
+      alert(msg.message);
+      socket.close();
+      break;
+    case 'INTERVIEW_DONE':
+      addTurn('ai', msg.message);
+      setStatus('Interview complete ✓');
+      stopBtn.classList.add('hidden');
+      window.speechSynthesis.cancel();
+      stopLocalTimer();   // ← ADDED: stop ticking when interview ends
+      break;
+  }
+}
+
+// ─── AUDIO CAPTURE ────────────────────────────────────────────────
+async function setupAudio() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl:  true,
+      sampleRate:       16000,
+    }
+  });
+
+  audioContext = new AudioContext({ sampleRate: 16000 });
+
+  const processorBlob = new Blob([AUDIO_WORKLET_CODE], { type: 'application/javascript' });
+  const workletURL    = URL.createObjectURL(processorBlob);
+  await audioContext.audioWorklet.addModule(workletURL);
+
+  const source = audioContext.createMediaStreamSource(mediaStream);
+  workletNode  = new AudioWorkletNode(audioContext, 'pcm-processor');
+
+  workletNode.port.onmessage = (event) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    // ─── ADDED: BARGE-IN / INTERRUPT DETECTION ────────────────────
+    // If Sarah is currently speaking and the user starts talking,
+    // detect speech energy in the audio buffer and send INTERRUPT
+    if (window.speechSynthesis.speaking && currentUtterance) {
+      const samples = new Int16Array(event.data);
+      // Simple energy threshold: if average absolute amplitude > threshold,
+      // assume the user is speaking (not just background noise)
+      let energy = 0;
+      for (let i = 0; i < samples.length; i++) {
+        energy += Math.abs(samples[i]);
+      }
+      const avgEnergy = energy / samples.length;
+
+      // 800 is a reasonable threshold for "someone speaking close to mic"
+      // Tune this if too sensitive (lower) or not sensitive enough (higher)
+      if (avgEnergy > 800) {
+        speechFrameCount++;
+        // Need 3 consecutive loud frames to trigger (~90ms) — avoids false positives
+        if (speechFrameCount >= 3) {
+          console.log("[INTERRUPT] User started speaking — sending interrupt");
+          socket.send(JSON.stringify({
+            type: "INTERRUPT",
+            spoken_so_far: currentSpokenText
+          }));
+          stopSpeaking();
+          speechFrameCount = 0;
+        }
+      } else {
+        speechFrameCount = 0;
+      }
+      // While Sarah is speaking we don't send audio bytes
+      // (the interrupt above is enough — once stopped, audio will flow again)
+      return;
+    }
+
+    // Normal case: Sarah is not speaking, just send the audio
+    speechFrameCount = 0;
+    socket.send(event.data);
+  };
+
+  source.connect(workletNode);
+  setStatus('Sarah will speak first...', 'speaking');
+}
+
+// Audio worklet: converts Float32 mic samples → 16-bit PCM
+const AUDIO_WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = [];
+    this.targetSize = 480;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const channel = input[0];
+    for (let i = 0; i < channel.length; i++) this.buffer.push(channel[i]);
+    while (this.buffer.length >= this.targetSize) {
+      const chunk = this.buffer.splice(0, this.targetSize);
+      const int16 = new Int16Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) {
+        const s = Math.max(-1, Math.min(1, chunk[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      this.port.postMessage(int16.buffer);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+</script>
+
+</body>
+</html>

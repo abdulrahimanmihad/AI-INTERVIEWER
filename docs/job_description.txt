@@ -1,0 +1,32 @@
+Senior Backend Engineer — AI Products
+
+ABOUT THE ROLE:
+We are looking for an experienced backend engineer to build and scale our AI-powered products. You will own systems that handle real-time voice interactions with thousands of users.
+
+REQUIRED SKILLS:
+- Strong Python with async programming (FastAPI, asyncio)
+- Production experience with WebSocket-based real-time systems
+- Experience integrating LLM APIs (OpenAI, Anthropic Claude, Groq, AWS Bedrock)
+- Understanding of speech-to-text and text-to-speech pipelines
+- SQL databases (PostgreSQL) and Redis for state management
+- Vector databases and RAG implementation experience
+- Familiarity with LangChain or similar LLM frameworks
+
+PREFERRED SKILLS:
+- Experience with LangGraph or agentic AI workflows
+- Production deployment experience (Docker, AWS, GCP)
+- Voice Activity Detection (VAD) and audio processing
+- Latency optimization for real-time applications
+- MLflow or LangSmith for LLM observability
+- Cost optimization for LLM-heavy systems
+
+EVALUATION CRITERIA:
+- Technical accuracy: Does the candidate truly understand these systems?
+- Production experience: Have they shipped real systems used by real users?
+- System design: Can they reason about concurrency, latency, and failure modes?
+- Communication: Can they explain complex technical decisions clearly?
+
+WHAT WE OFFER:
+- Competitive salary plus performance bonus
+- Remote-friendly with flexible hours
+- Direct ownership of high-impact systems

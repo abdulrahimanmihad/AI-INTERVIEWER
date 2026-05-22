@@ -1,0 +1,61 @@
+# ────────────────────────────────────────────────────────────────
+# docker-compose.yml — one command to start everything locally
+#
+# WHY DOCKER COMPOSE:
+#   Starts the app + Redis + PostgreSQL together with one command
+#   No need to install Redis / PostgreSQL manually
+#
+# USAGE:
+#   docker-compose up
+#   Then open http://localhost:8000
+# ────────────────────────────────────────────────────────────────
+
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: interviewer
+      POSTGRES_PASSWORD: interviewer
+      POSTGRES_DB: interviewer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U interviewer"]
+      interval: 5s
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://interviewer:interviewer@postgres:5432/interviewer
+      # Pass through API keys from your local environment
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY}
+      RAG_METHOD: ${RAG_METHOD:-agentic}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./chroma_db:/app/chroma_db
+
+volumes:
+  postgres_data:
