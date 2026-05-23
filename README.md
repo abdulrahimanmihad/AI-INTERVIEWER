@@ -93,10 +93,6 @@ docker-compose up
 # Open http://localhost:8000
 ```
 
-## How to compare the three RAG methods
-
-The whole point of having three methods is to find out which works best for **your** data.
-
 ### Step 1 — Run interviews with each method
 
 ```bash
@@ -154,24 +150,6 @@ LANGSMITH_API_KEY=ls-...
 
 You'll see every LLM call, every prompt, every response — invaluable for debugging.
 
-## Deploy
-
-### Railway (easiest, free tier)
-
-1. Push code to GitHub
-2. Railway → New Project → Deploy from GitHub
-3. Add Redis service (one click)
-4. Add Postgres service (one click)
-5. Set environment variables (`GROQ_API_KEY` etc.)
-6. Railway auto-detects Dockerfile and deploys
-
-### Fly.io
-
-```bash
-fly launch
-fly secrets set GROQ_API_KEY=your-key
-fly deploy
-```
 
 ## Architecture diagram
 
@@ -214,14 +192,3 @@ fly deploy
                                           ↓
                               (when done) Archive to PostgreSQL
 ```
-
-## Key teaching points (for explaining to him)
-
-- **rag_factory.py** is the Strategy pattern — main.py doesn't know which RAG method runs.
-- **llm_provider.py** is the Adapter pattern — every other file uses the same interface regardless of provider.
-- **vectorstore.py** is the single source for embeddings — impossible to use a different model for ingest vs query.
-- **Module-level Whisper load** — the most important latency optimization in the entire app.
-- **VAD/processor decoupling** — audio is never dropped while STT/LLM runs.
-- **SQL-then-Redis-delete ordering** — data is never lost on archive failure.
-
-Each design decision is documented in inline comments in each file.

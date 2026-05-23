@@ -1,25 +1,3 @@
-"""
-llm_provider.py
-═════════════════════════════════════════════════════════════════════
-Unified LLM interface — same function call, different backend.
-
-WHY THIS FILE EXISTS:
-    Without this: every other file has "if openai... elif groq... elif bedrock..."
-    With this: every other file just calls llm_chat() and forgets about providers
-    To switch providers: change LLM_PROVIDER in config.py, done.
-
-PATTERN — this is called the "Adapter pattern" or "Strategy pattern":
-    The rest of the app talks to ONE interface (llm_chat).
-    This file translates that to whichever provider is active.
-
-HOW TO ADD A NEW PROVIDER:
-    Add a function _xxx_chat() that takes messages + returns (text, tokens)
-    Add an "elif" branch to llm_chat()
-    Add the model names to config.py
-    Done — no other file needs to change
-═════════════════════════════════════════════════════════════════════
-"""
-
 import os
 import json
 from typing import List, Tuple
@@ -34,10 +12,7 @@ from config import (
     BEDROCK_MAIN_MODEL, BEDROCK_FAST_MODEL,
 )
 
-
-# ═════════════════════════════════════════════════════════════════
-#  CLIENT INITIALIZATION — only the active provider is set up
-# ═════════════════════════════════════════════════════════════════
+#  CLIENT INITIALIZATION — only the active provider is set u
 _openai_client = None
 _groq_client   = None
 _bedrock_client = None
@@ -48,8 +23,6 @@ if LLM_PROVIDER == "openai":
     print(f"[LLM] Using OpenAI ({OPENAI_MAIN_MODEL})")
 
 elif LLM_PROVIDER == "groq":
-    # Groq uses the OpenAI client interface — just different base URL
-    # WHY: Groq deliberately mimics OpenAI's API so you don't rewrite code
     from openai import AsyncOpenAI
     _groq_client = AsyncOpenAI(
         api_key=GROQ_API_KEY,
@@ -58,8 +31,6 @@ elif LLM_PROVIDER == "groq":
     print(f"[LLM] Using Groq ({GROQ_MAIN_MODEL}) — FREE tier")
 
 elif LLM_PROVIDER == "bedrock":
-    # AWS Bedrock uses boto3 (AWS SDK)
-    # boto3 reads AWS credentials from environment automatically
     import boto3
     _bedrock_client = boto3.client(
         "bedrock-runtime",
@@ -70,10 +41,7 @@ elif LLM_PROVIDER == "bedrock":
 else:
     raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
-
-# ═════════════════════════════════════════════════════════════════
-#  PROVIDER-SPECIFIC FUNCTIONS
-# ═════════════════════════════════════════════════════════════════
+#  PROVIDER-SPECIFIC FUNCTION
 
 async def _openai_chat(
     messages: List[dict],
@@ -161,10 +129,7 @@ async def _bedrock_chat(
 
     return await asyncio.to_thread(call)
 
-
-# ═════════════════════════════════════════════════════════════════
-#  PUBLIC API — what the rest of the app calls
-# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — what the rest of the app call
 
 def get_main_model() -> str:
     """Return the 'big' model name for the active provider."""
@@ -192,22 +157,6 @@ async def llm_chat(
 ) -> Tuple[str, int]:
     """
     THE main function every other file uses to talk to an LLM.
-
-    Same signature regardless of which provider is active.
-
-    Args:
-        messages:    OpenAI-style [{"role": "user", "content": "..."}] list
-        model:       Specific model name, or None to use the main model
-        max_tokens:  Cap on response length
-        temperature: 0 = deterministic, 1 = creative
-
-    Returns:
-        (response_text, total_tokens_used)
-
-    WHAT IF YOU DIDN'T HAVE THIS WRAPPER:
-        Every file would have provider-specific code.
-        Switching providers would mean changing 20 places.
-        Adding a new provider would touch every file.
     """
     if model is None:
         model = get_main_model()

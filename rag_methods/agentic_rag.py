@@ -1,28 +1,3 @@
-"""
-rag_methods/agentic_rag.py
-
-AGENTIC RAG full agent with self-correction.
-
-
-THIS IS "AGENTIC" BECAUSE:
-    The agent makes DECISIONS at multiple steps:
-    1. Should I retrieve?
-    2. Are the retrieved docs actually useful? (grade)
-    3. If not, should I rewrite my query?
-    4. Should I generate or try again?
-
-WHY THIS IS BETTER THAN PLAIN LANGGRAPH:
-    LangGraph just decides "retrieve or not"
-    Agentic also catches BAD retrievals and rewrites the query
-    Result: higher quality context, fewer hallucinations
-    Cost: more API calls per turn
-
-TRADEOFF:
-    Best quality, slowest, most expensive
-    Use when accuracy matters more than latency
-
-"""
-
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 
@@ -112,10 +87,6 @@ async def grade_node(state: AgentState) -> AgentState:
     This is the "self-correction" part — the agent doesn't trust the
     vector search blindly. It double-checks.
 
-    WHY THIS MATTERS:
-        Vector search finds the most SIMILAR chunks — but similar isn't
-        always RELEVANT. The candidate might mention something we have
-        no docs about. Grading catches that case.
     """
     if not state["rag_docs"]:
         state["_grade"] = "NOT_RELEVANT"

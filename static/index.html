@@ -4,8 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI Interviewer — Demo</title>
-<!--
-═══════════════════════════════════════════════════════════════════════
+
 FRONTEND with browser speech (FREE — no API needed)
 
 KEY DIFFERENCE FROM OPENAI TTS VERSION:
@@ -13,11 +12,6 @@ KEY DIFFERENCE FROM OPENAI TTS VERSION:
     Browser uses window.speechSynthesis to speak it
     Zero API calls, zero cost, works offline
 
-WHY THIS IS FINE FOR DEMO:
-    Modern browser voices (Chrome, Safari) sound very good
-    The interview is in English which has the best voice support
-    No API quota issues if many people try the demo
-═══════════════════════════════════════════════════════════════════════
 -->
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -150,9 +144,8 @@ WHY THIS IS FINE FOR DEMO:
 
 <script>
 /*
-═══════════════════════════════════════════════════════════════════════
+
 FRONTEND LOGIC
-═══════════════════════════════════════════════════════════════════════
 
 Connection flow:
     1. User clicks Start → fill form fields
@@ -163,7 +156,7 @@ Connection flow:
        - TRANSCRIPT: show what we said
        - AI_REPLY: show what AI said
        - STATUS: update status indicator
-═══════════════════════════════════════════════════════════════════════
+
 */
 
 // DOM elements

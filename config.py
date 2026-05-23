@@ -1,48 +1,20 @@
 """
-config.py
-═════════════════════════════════════════════════════════════════════
 ALL settings in one place. Switching providers or RAG methods = 1 line.
 
-KEY SWITCHES (the ones you'll change most):
-    RAG_METHOD       — "classic" | "langgraph" | "agentic"
-    LLM_PROVIDER     — "openai"  | "groq"      | "bedrock"
-
-Change those and the whole app uses the new option — no other edits needed.
-═════════════════════════════════════════════════════════════════════
 """
 
 import os
 from dotenv import load_dotenv
 
-# Load .env file with your API keys
-# WHY: keeps secrets out of code/git. .env stays only on your machine.
+
 load_dotenv()
 
-
-# ═════════════════════════════════════════════════════════════════
-#  THE TWO MAIN SWITCHES
-# ═════════════════════════════════════════════════════════════════
-
-# Switch between RAG methods — change this one string to test each
-# WHY 3 METHODS: he asked to compare. We measure latency + token cost
-# in MLflow and pick the winner.
-#
-# "classic"   = always retrieve, then generate (simple, sometimes wasteful)
-# "langgraph" = graph with conditional retrieval (faster, smarter routing)
-# "agentic"   = full agent: route → grade docs → rewrite query → generate
-#               (best quality, more API calls)
+# THE TWO MAIN SWITCHES
 RAG_METHOD: str = os.getenv("RAG_METHOD", "agentic")
-
-# Switch between LLM providers — same idea
-# "openai"  = OpenAI API (best quality, costs money)
-# "groq"    = Groq API (free tier, Llama 3.3 70B, very fast)
-# "bedrock" = AWS Bedrock (Claude/Llama via AWS — for AWS shops)
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")
 
+# API KEYS — one per provider, only the active one needs to be set
 
-# ═════════════════════════════════════════════════════════════════
-#  API KEYS — one per provider, only the active one needs to be set
-# ═════════════════════════════════════════════════════════════════
 OPENAI_API_KEY:   str = os.getenv("OPENAI_API_KEY", "")
 GROQ_API_KEY:     str = os.getenv("GROQ_API_KEY", "")
 
@@ -51,24 +23,15 @@ AWS_REGION:       str = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY:   str = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_KEY:   str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 
-
-# ═════════════════════════════════════════════════════════════════
-#  MODEL NAMES — per provider (active one used based on LLM_PROVIDER)
-# ═════════════════════════════════════════════════════════════════
-
+# MODEL NAMES — per provider (active one used based on LLM_PROVIDER)
 # OpenAI
 OPENAI_MAIN_MODEL: str = "gpt-4o"
 OPENAI_FAST_MODEL: str = "gpt-4o-mini"
 
-# Groq (free tier — Llama 3.3 is the best free model right now)
-GROQ_MAIN_MODEL: str = "llama-3.3-70b-versatile"   # smart, slower
-GROQ_FAST_MODEL: str = "llama-3.1-8b-instant"      # fast, dumber
 
-# AWS Bedrock
-# Default: Llama 3.3 70B (cheaper, fast)
-# For Claude: change to "anthropic.claude-3-5-sonnet-20241022-v2:0"
-# IMPORTANT: You must enable model access in AWS Console → Bedrock → Model Access
-# BEFORE these model IDs will work. Without enabling, calls return AccessDeniedException.
+GROQ_MAIN_MODEL: str = "llama-3.3-70b-versatile"   
+GROQ_FAST_MODEL: str = "llama-3.1-8b-instant"      
+
 BEDROCK_MAIN_MODEL: str = os.getenv(
     "BEDROCK_MAIN_MODEL",
     "meta.llama3-3-70b-instruct-v1:0"
@@ -78,50 +41,26 @@ BEDROCK_FAST_MODEL: str = os.getenv(
     "meta.llama3-1-8b-instruct-v1:0"
 )
 
-
-# ═════════════════════════════════════════════════════════════════
-#  EMBEDDING MODEL — for RAG vector search
-# ═════════════════════════════════════════════════════════════════
-# Embeddings convert text → numbers so we can search by meaning
-# Same model MUST be used for ingest and query — otherwise garbage results
-#
-# "openai" = text-embedding-3-small (paid, very good)
-# "local"  = sentence-transformers (free, runs on your laptop)
 EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "local")
 
-OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
-LOCAL_EMBEDDING_MODEL: str  = "all-MiniLM-L6-v2"  # 90MB, runs offline, free
+OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small" #Paid
+LOCAL_EMBEDDING_MODEL: str  = "all-MiniLM-L6-v2"  
 
-
-# ═════════════════════════════════════════════════════════════════
 #  WHISPER (Speech-to-Text)
-# ═════════════════════════════════════════════════════════════════
-# Model size — bigger = more accurate but slower to load and run
-#   "tiny"     ≈ 75MB,  worst accuracy, fastest
-#   "base"     ≈ 145MB, basic accuracy (was default — too inaccurate)
-#   "small"    ≈ 480MB, much better accuracy ← NEW DEFAULT
-#   "medium"   ≈ 1.5GB, very accurate, slow
-#   "large-v3" ≈ 3GB,   best accuracy, slowest
-# Switched to "small" because base was missing too many words.
-# Small loads in ~10 seconds, transcribes in 1-2s for typical answers.
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
 
 
-# ═════════════════════════════════════════════════════════════════
+
 #  TTS (Text-to-Speech)
-# ═════════════════════════════════════════════════════════════════
-# "openai"  = OpenAI TTS (paid, very natural)
-# "browser" = Browser's built-in speech (free, decent quality, no API call)
+
 TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "browser")
 
 TTS_MODEL: str  = "tts-1"
 TTS_VOICE: str  = "nova"
 TTS_SPEED: float = 1.0
 
-
-# ═════════════════════════════════════════════════════════════════
 #  LLM PARAMETERS
-# ═════════════════════════════════════════════════════════════════
+
 TEMPERATURE_INTERVIEW: float = 0.7   # natural variation in questions
 TEMPERATURE_EVAL: float      = 0.0   # scoring must be deterministic
 TEMPERATURE_GUARD: float     = 0.0   # rule checks must be consistent
@@ -133,81 +72,45 @@ MAX_TOKENS_EVAL: int       = 250
 
 MAX_HISTORY_TURNS: int = 6
 
-
-# ═════════════════════════════════════════════════════════════════
 #  VAD (Voice Activity Detection)
-# ═════════════════════════════════════════════════════════════════
+
 SAMPLE_RATE: int        = 16000
 FRAME_DURATION_MS: int  = 30
-# How long the user must be silent before we decide they finished speaking
-# 800ms was too aggressive — kept cutting users off mid-thought
-# 1500ms gives natural pauses room to breathe without dragging interview out
+
 SILENCE_TRIGGER_MS: int = 800
-# VAD_AGGRESSIVENESS 1 — this value worked well yesterday.
-# 2 was too strict and contributed to audio issues.
 VAD_AGGRESSIVENESS: int = 2
 
 FRAME_BYTES: int      = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
 SILENCE_FRAMES: int   = SILENCE_TRIGGER_MS // FRAME_DURATION_MS
 
-# Safety cap on speech buffer size before force-flushing.
-# 16000 samples/s × 2 bytes/sample × 60 seconds = 1,920,000 bytes
-# Was 480000 (30s) — caused long answers to be cut off mid-sentence.
-# 60 seconds is plenty for any reasonable interview answer.
-# If a candidate truly speaks for >60s without pausing 1.5s, we force-flush
-# but at least they got 60s of speech in (not 30s).
-MAX_BUFFER_BYTES: int = 1920000   # ~60 seconds of audio
+MAX_BUFFER_BYTES: int = 1920000   # 60 seconds of audio
 
-
-# ═════════════════════════════════════════════════════════════════
 #  INTERVIEW DURATION
-# ═════════════════════════════════════════════════════════════════
-# Hard timer in seconds — interview automatically ends after this
-# 10 minutes = 600 seconds is reasonable for a screening interview
-# Replaces the [INTERVIEW_DONE] marker approach which was unreliable
-# (the AI would sometimes forget to add the marker, leaving interviews running forever)
 INTERVIEW_DURATION_SECONDS: int = int(os.getenv("INTERVIEW_DURATION_SECONDS", "600"))
 
 # Warning sent to AI when this much time remains so it wraps up gracefully
 INTERVIEW_WARNING_SECONDS: int = 60
 
-
-# ═════════════════════════════════════════════════════════════════
 #  RAG PARAMETERS
-# ═════════════════════════════════════════════════════════════════
 CHUNK_SIZE: int    = 400
 CHUNK_OVERLAP: int = 80
 RAG_TOP_K: int     = 3
 
-
-# ═════════════════════════════════════════════════════════════════
 #  POSTGRESQL (with SQLite fallback for local dev without PG)
-# ═════════════════════════════════════════════════════════════════
+
 # WHY POSTGRESQL: handles concurrent writes (SQLite can't)
 # If DATABASE_URL not set, app falls back to SQLite for easy local testing
 DATABASE_URL: str = os.getenv(
     "DATABASE_URL",
     "sqlite:///./interviews.db"   # fallback for local dev
 )
-# Production example:
-#   DATABASE_URL=postgresql://user:pass@host:5432/interviewer
 
-
-# ═════════════════════════════════════════════════════════════════
 #  REDIS
-# ═════════════════════════════════════════════════════════════════
 REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB: int   = int(os.getenv("REDIS_DB", "0"))
 
-
-# ═════════════════════════════════════════════════════════════════
 #  OBSERVABILITY — MLflow + LangSmith
-# ═════════════════════════════════════════════════════════════════
-# MLflow: tracks experiments (which RAG method was used, latency, tokens, cost)
-# LangSmith: tracks LLM calls in detail (what was the prompt, what came back)
-# Both have generous free tiers. LangSmith is from the LangChain team.
-
 # Set to "" to disable each one
 MLFLOW_TRACKING_URI: str = os.getenv("MLFLOW_TRACKING_URI", "./mlruns")
 MLFLOW_EXPERIMENT_NAME: str = "ai-interviewer"
@@ -220,10 +123,7 @@ if LANGSMITH_API_KEY:
     os.environ["LANGSMITH_API_KEY"] = LANGSMITH_API_KEY
     os.environ["LANGSMITH_PROJECT"] = LANGSMITH_PROJECT
 
-
-# ═════════════════════════════════════════════════════════════════
 #  GUARD LAYER — forbidden patterns in AI output
-# ═════════════════════════════════════════════════════════════════
 CASUAL_PATTERNS: list = [
     "gonna", "wanna", "gotta", "kinda", "sorta",
     "yeah", "yep", "nope", "dunno", "lemme",
@@ -232,10 +132,7 @@ CASUAL_PATTERNS: list = [
     "language model", "i don't have",
 ]
 
-
-# ═════════════════════════════════════════════════════════════════
 #  SYSTEM PROMPT (the interviewer persona + rules)
-# ═════════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """You are Sarah, a senior technical recruiter conducting a structured job interview.
 
 PERSONALITY:

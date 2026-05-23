@@ -1,20 +1,3 @@
-"""
-vectorstore.py
-═════════════════════════════════════════════════════════════════════
-The ONE vector database shared by all three RAG methods.
-
-WHY ONE FILE:
-    All three RAG methods (classic, langgraph, agentic) hit the same DB.
-    Storing it here means switching RAG_METHOD doesn't change the DB.
-    You ingest once, all three methods can use the documents.
-
-WHY SAME EMBEDDING MODEL:
-    Imported from embeddings.py — single source of truth.
-    The collection was created with one model — using a different one
-    to query = garbage results.
-═════════════════════════════════════════════════════════════════════
-"""
-
 import os
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -23,9 +6,7 @@ from config import CHUNK_SIZE, CHUNK_OVERLAP
 from embeddings import embeddings  # the shared embedding model
 
 
-# ═════════════════════════════════════════════════════════════════
 #  SHARED VECTOR STORE
-# ═════════════════════════════════════════════════════════════════
 vectorstore = Chroma(
     collection_name="interview_knowledge",
     embedding_function=embeddings,
@@ -33,9 +14,7 @@ vectorstore = Chroma(
 )
 
 
-# ═════════════════════════════════════════════════════════════════
 #  TEXT SPLITTER — shared too
-# ═════════════════════════════════════════════════════════════════
 _splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP,

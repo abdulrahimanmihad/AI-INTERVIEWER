@@ -1,29 +1,3 @@
-"""
-database.py
-═════════════════════════════════════════════════════════════════════
-PostgreSQL (production) with SQLite fallback (local dev).
-
-WHY POSTGRESQL FOR PRODUCTION:
-    - Handles concurrent writes (SQLite locks the whole file)
-    - Connection pooling (multiple requests share connections)
-    - Battle-tested for real load
-
-WHY SQLITE FOR LOCAL DEV:
-    - Zero setup — just a file
-    - Same SQL as PostgreSQL (mostly)
-    - Perfect for testing on your laptop
-
-HOW THE SWITCH WORKS:
-    config.DATABASE_URL determines which one:
-        sqlite:///./interviews.db          → SQLite (default)
-        postgresql://user:pass@host/db      → PostgreSQL
-
-WHY SQLALCHEMY:
-    One ORM, both databases. Same Python code works for both.
-    Connection pooling built in.
-    Async support via SQLAlchemy 2.0.
-═════════════════════════════════════════════════════════════════════
-"""
 
 import json
 import uuid
@@ -35,10 +9,7 @@ from sqlalchemy import Column, String, Text, Integer, DateTime, select, func
 
 from config import DATABASE_URL
 
-
-# ═════════════════════════════════════════════════════════════════
 #  ENGINE — connection pool
-# ═════════════════════════════════════════════════════════════════
 # Convert sync URL to async URL for SQLAlchemy 2.0 async
 # sqlite:///   → sqlite+aiosqlite:///
 # postgresql:// → postgresql+asyncpg://
@@ -52,14 +23,6 @@ else:
     ASYNC_URL = DATABASE_URL
     IS_SQLITE = False
 
-# Connection pool settings ONLY apply to PostgreSQL.
-# SQLite is a single file — it uses NullPool (no real pooling possible).
-# Passing pool_size to SQLite raises TypeError.
-#
-# WHY pool_size=10 for PostgreSQL:
-#   Enough for 10 concurrent interviews without exhausting database limits.
-# WHY pool_pre_ping=True:
-#   Tests connection before use, recovers from dropped connections.
 if IS_SQLITE:
     engine = create_async_engine(
         ASYNC_URL,
@@ -83,9 +46,7 @@ Base = declarative_base()
 print(f"[DB] Using {'SQLite' if IS_SQLITE else 'PostgreSQL'}")
 
 
-# ═════════════════════════════════════════════════════════════════
 #  MODELS — Python classes that map to DB tables
-# ═════════════════════════════════════════════════════════════════
 class User(Base):
     """Registered candidates."""
     __tablename__ = "users"
@@ -108,9 +69,7 @@ class CompletedInterview(Base):
     completed_at    = Column(DateTime, server_default=func.now())
 
 
-# ═════════════════════════════════════════════════════════════════
 #  INIT
-# ═════════════════════════════════════════════════════════════════
 async def init_db():
     """Create tables if they don't exist. Called once at startup."""
     async with engine.begin() as conn:
@@ -118,9 +77,7 @@ async def init_db():
     print("[DB] Tables initialized")
 
 
-# ═════════════════════════════════════════════════════════════════
 #  OPERATIONS
-# ═════════════════════════════════════════════════════════════════
 async def check_interview_status(email: str) -> Tuple[str, Optional[str]]:
     """
     Check if email completed an interview.

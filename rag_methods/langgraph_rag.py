@@ -144,7 +144,7 @@ async def generate_node(state: GraphState) -> GraphState:
 
     system_content += f"\n\nTIME GUIDANCE: {time_note}"
 
-    messages = [{"role": "system", "content": system_content}] + state["history"][-6:]
+    messages = [{"role": "system", "content": system_content}] + state["history"]
 
     text, tokens = await llm_chat(
         messages=messages,
@@ -174,7 +174,7 @@ async def guard_node(state: GraphState) -> GraphState:
     )
     messages = (
         [{"role": "system", "content": system_content}]
-        + state["history"][-6:]
+        + state["history"]
         + [{"role": "assistant", "content": state["response"]}]
         + [{"role": "user", "content": "Rephrase that formally as a senior recruiter."}]
     )
