@@ -47,7 +47,7 @@ OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small" #Paid
 LOCAL_EMBEDDING_MODEL: str  = "all-MiniLM-L6-v2"  
 
 #  WHISPER (Speech-to-Text)
-WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+STT_PROVIDER = "groq"   # "local" or "groq"
 
 
 

@@ -10,7 +10,8 @@ import logging
 import os
 import time
 from pathlib import Path
-
+import wave
+from groq import Groq
 import numpy as np
 import redis.asyncio as redis
 import torch
@@ -20,15 +21,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+
 from config import (
-    WHISPER_MODEL,
     TTS_PROVIDER,
     SAMPLE_RATE, FRAME_BYTES, SILENCE_FRAMES, VAD_AGGRESSIVENESS, MAX_BUFFER_BYTES,
     MAX_HISTORY_TURNS,
     REDIS_HOST, REDIS_PORT, REDIS_DB,
     RAG_METHOD,
     LLM_PROVIDER,
-    SYSTEM_PROMPT,
+    STT_PROVIDER,
     MAX_TOKENS_SUMMARY,
     INTERVIEW_DURATION_SECONDS,
     INTERVIEW_WARNING_SECONDS,
@@ -39,7 +40,7 @@ from rag_factory import run_turn
 from observability import track_turn, start_session_run, end_session_run
 from llm_provider import llm_chat, get_fast_model
 
-
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -56,10 +57,6 @@ redis_client = redis.Redis(
 session_tasks: dict = {}
 ai_speaking_sessions: set = set()
 
-log.info(f"Loading Whisper: {WHISPER_MODEL}")
-_device       = "cuda" if torch.cuda.is_available() else "cpu"
-whisper_model = whisper.load_model(WHISPER_MODEL, device=_device)
-log.info(f"Whisper loaded on {_device}")
 
 vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
@@ -99,70 +96,136 @@ async def serve_frontend():
 def _whisper_transcribe(audio_bytes: bytes) -> str:
     if not audio_bytes:
         return ""
-    try:
-        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-        if len(audio_int16) == 0:
-            return ""
 
-        avg_energy = np.abs(audio_int16).mean()
-        if avg_energy < 160:
-            log.info(f"[STT] Skipping low-energy audio (energy={avg_energy:.0f})")
-            return ""
-
-        audio_array = audio_int16.astype(np.float32) / 32768.0
-
-        if len(audio_array) < 4800:
-            return ""
-
-        result = whisper_model.transcribe(
-            audio_array,
-            language="en",
-            fp16=(_device == "cuda"),
-            condition_on_previous_text=False,
-            temperature=0.0,
-            no_speech_threshold=0.6,
-            logprob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
-            initial_prompt="Interview about software engineering.",
-        )
-        text = result["text"].strip()
-
-        if result.get("segments"):
-            avg_no_speech = sum(s.get("no_speech_prob", 0) for s in result["segments"]) / len(result["segments"])
-            if avg_no_speech > 0.6:
-                log.info(f"[STT] Hallucination rejected (no_speech_prob={avg_no_speech:.2f}): '{text}'")
-                return ""
-
-        text_lower = text.lower().strip(".!?, ")
-        if "interview about software" in text_lower or "software engineering" == text_lower:
-            log.info(f"[STT] Rejected echoed initial_prompt: '{text}'")
-            return ""
-
-        HALLUCINATION_PHRASES = {
-            "thank you for watching",
-            "subscribe", "please subscribe", "subscribe to my channel",
-            "like and subscribe",
-        }
-        if text_lower in HALLUCINATION_PHRASES:
-            log.info(f"[STT] Hallucination phrase rejected: '{text}'")
-            return ""
-
-        if len(text) < 3:
-            return ""
-
-        return text
-
-    except Exception as e:
-        log.error(f"[STT] {e}")
+    audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+    if len(audio_int16) == 0:
         return ""
+
+    # Energy gate BEFORE the API call — don't pay to transcribe silence
+    avg_energy = np.abs(audio_int16).mean()
+    if avg_energy < 160:
+        log.info(f"[STT] Skipping low-energy audio (energy={avg_energy:.0f})")
+        return ""
+
+    # Groq needs a real audio file, so wrap raw PCM into a WAV in memory
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)      # mono
+        wf.setsampwidth(2)      # 16-bit = 2 bytes
+        wf.setframerate(16000)  # 16 kHz
+        wf.writeframes(audio_bytes)
+    buf.seek(0)
+    buf.name = "audio.wav"      # the SDK uses the extension
+
+    # ── API call (only this part needs the try/except) ──
+    try:
+        result = groq_client.audio.transcriptions.create(
+            file=buf,
+            model="whisper-large-v3-turbo",
+            language="en",
+            temperature=0.0,
+            response_format="verbose_json",  # verbose_json gives segments
+        )
+    except Exception as e:
+        log.error(f"[STT] Groq transcription failed: {e}")
+        return ""
+
+    text = (result.text or "").strip()
+    if not text:
+        return ""
+
+    # ── Hallucination defense (runs after we safely have text) ──
+    segments = getattr(result, "segments", None)
+    if segments:
+        def _no_speech(s):
+            return s.get("no_speech_prob", 0) if isinstance(s, dict) else getattr(s, "no_speech_prob", 0)
+        avg_no_speech = sum(_no_speech(s) for s in segments) / len(segments)
+        if avg_no_speech > 0.6:
+            log.info(f"[STT] Hallucination rejected (no_speech_prob={avg_no_speech:.2f}): '{text}'")
+            return ""
+
+    text_lower = text.lower().strip(".!?, ")
+
+    if "interview about artificial" in text_lower:
+        log.info(f"[STT] Rejected echoed initial_prompt: '{text}'")
+        return ""
+
+    HALLUCINATION_PHRASES = {
+        "thank you for watching",
+        "subscribe", "please subscribe", "subscribe to my channel",
+        "like and subscribe",
+    }
+    if text_lower in HALLUCINATION_PHRASES:
+        log.info(f"[STT] Hallucination phrase rejected: '{text}'")
+        return ""
+
+    if len(text) < 3:
+        return ""
+
+    return text
 
 
 async def transcribe(audio_bytes: bytes) -> str:
     if not audio_bytes:
         return ""
+    # All STT runs through Groq's hosted Whisper (fast). Kept in a thread
+    # because the Groq SDK call is blocking and our pipeline is async.
     return await asyncio.to_thread(_whisper_transcribe, audio_bytes)
 
 
+# ═════════════════════════════════════════════════════════════════
+#  SEMANTIC ENDPOINT DETECTION (Technique 4)
+# ═════════════════════════════════════════════════════════════════
+def _is_thought_complete(text: str) -> bool:
+    """
+    Decide whether the user's utterance sounds like a FINISHED thought or a
+    mid-sentence pause. This lets us end the turn fast when they're clearly
+    done, but wait longer when they're obviously still mid-sentence — instead
+    of a single fixed silence timer that always trades off cutting people off
+    against feeling laggy. Rule-based, so it adds zero latency.
+
+    Returns True  -> thought looks complete  -> respond quickly
+    Returns False -> thought looks unfinished -> wait longer for continuation
+    """
+    t = text.strip().lower()
+    if not t:
+        return False
+
+    # Words that, when a sentence ends on them, signal the speaker isn't done:
+    # conjunctions, articles, prepositions, pronouns, auxiliaries, fillers.
+    DANGLING_WORDS = {
+        "and", "but", "or", "so", "because", "however", "although", "though",
+        "while", "since", "if", "when", "as", "which", "who",
+        "the", "a", "an", "my", "your", "our", "their", "his", "her", "its",
+        "to", "of", "for", "in", "on", "at", "with", "from", "by", "about",
+        "i", "we", "they", "he", "she", "you",
+        "is", "are", "was", "were", "will", "would", "can", "could", "should",
+        "like", "really", "very", "just", "also", "then", "actually",
+        "um", "uh", "er", "basically", "kind", "sort", "such" ,"ehh" ,"mm"
+    }
+
+    stripped = t.rstrip(".!?,;: ")
+    words = stripped.split()
+    last_word = words[-1] if words else ""
+
+    # 1. Dangling connective/filler word -> clearly mid-sentence
+    if last_word in DANGLING_WORDS:
+        return False
+
+    # 2. Ends with sentence-ending punctuation -> looks complete
+    if t.endswith((".", "?", "!")):
+        return True
+
+    # 3. Trailing comma/semicolon/dash -> mid-list, not done
+    if t.endswith((",", ";", ":", "-")):
+        return False
+
+    # 4. Default: treat as complete so we don't over-hold normal speech.
+    #    (The safety-flush + merge logic still catches the rare miss.)
+    return True
+
+
+#TTS
 async def _auto_release_speaking_lock(session_id: str, duration_seconds: float):
     await asyncio.sleep(duration_seconds)
     if session_id in ai_speaking_sessions:
@@ -179,7 +242,7 @@ async def send_response_for_speech(websocket: WebSocket, session_id: str, text: 
     estimated_seconds = (word_count / 2.5) + 2.0
     asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
 
-
+#USED FOR LISTENING
 async def vad_receiver_loop(
     websocket: WebSocket, session_id: str,
     audio_queue: asyncio.Queue, stop_event: asyncio.Event,
@@ -223,18 +286,6 @@ async def vad_receiver_loop(
                     ai_speaking_sessions.discard(session_id)
                     log.info("[BARGE-IN] Frontend signaled interrupt. Listening to verify...")
                 continue
-
-            elif msg_type == "STOP":
-                if speech_buffer and speech_count >= MIN_SPEECH_FRAMES:
-                    await audio_queue.put(("audio", bytes(speech_buffer)))
-                speech_buffer.clear()
-                silence_count   = 0
-                speech_count    = 0
-                speech_started  = False
-                listening_sent  = False
-                verifying_barge_in = False
-                session_tasks.setdefault(session_id, {})["is_speaking"] = False
-
             elif msg_type == "TTS_DONE":
                 ai_speaking_sessions.discard(session_id)
                 verifying_barge_in = False
@@ -343,7 +394,7 @@ async def turn_processor_loop(
 
         kind, payload = item
 
-        # ── THE FIX: SAFETY NET TO PREVENT SILENT CRASHES ──
+        # ── SAFETY NET TO PREVENT SILENT CRASHES ──
         try:
             if kind == "interrupt":
                 await handle_barge_in(websocket, session_id, payload)
@@ -354,7 +405,6 @@ async def turn_processor_loop(
                 await process_partial_audio(websocket, session_id, payload)
         except Exception as e:
             log.error(f"[FATAL ERROR] The background processor crashed: {e}", exc_info=True)
-            # Send the error to your UI so you don't get stuck waiting
             try:
                 await websocket.send_json({"type": "STATUS", "message": "API Error - Check Terminal"})
             except Exception:
@@ -362,6 +412,7 @@ async def turn_processor_loop(
 
         audio_queue.task_done()
 
+#HAVE TO WORK ON IT
 async def process_partial_audio(
     websocket: WebSocket,
     session_id: str,
@@ -493,43 +544,56 @@ async def process_turn(
 
     is_speaking = session_tasks.get(session_id, {}).get("is_speaking", False)
 
+    # ── SEMANTIC ENDPOINT CHECK (Technique 4) ──
+    # Decide whether the utterance sounds finished. This shapes how patient
+    # we are: an incomplete thought ("I worked at Google for...") should wait
+    # for the continuation; a complete thought ("...for three years.") can be
+    # answered right away.
+    thought_complete = _is_thought_complete(full_user_text)
+
     if is_speaking or not audio_queue.empty():
-        log.info(f"[HOLD] User is still speaking. Holding buffer: '{full_user_text[:50]}...'")
-        # ── SAFETY TIMER: schedule a fallback flush ──
-        # If this held buffer never gets re-triggered by new audio (the edge
-        # case where is_speaking flips False right after we returned on HOLD),
-        # this timer fires the LLM after a short silence so the response
-        # isn't stranded. Any new audio cancels and replaces this timer.
-        _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue)
+        log.info(f"[HOLD] User still speaking. Holding: '{full_user_text[:50]}...'")
+        # incomplete thought -> wait longer; complete -> short safety net
+        grace = 2 if not thought_complete else 0.5
+        _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace)
         return
 
+    if not thought_complete:
+        # Quiet right now, but the sentence trails off mid-thought — the user
+        # is likely just pausing to think. Hold briefly and let them continue
+        # instead of cutting in on an unfinished sentence.
+        log.info(f"[ENDPOINT] Incomplete thought, waiting for continuation: '{full_user_text[:50]}...'")
+        _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, 2)
+        return
+
+    # Quiet AND the thought sounds complete -> respond immediately
+    log.info(f"[ENDPOINT] Complete thought, responding now: '{full_user_text[:50]}...'")
     await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
 
 
-def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue):
+def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=0.5):
     """
     Cancel any existing safety-flush task and schedule a new one.
-    The new audio that triggered this HOLD resets the timer, so the flush
-    only fires after the user has been genuinely quiet.
+    `grace` is set by the caller based on semantic completeness — a longer
+    wait for an unfinished sentence, a shorter one for a complete thought.
     """
     slot = session_tasks.setdefault(session_id, {})
     old = slot.get("safety_flush")
     if old and not old.done():
         old.cancel()
     slot["safety_flush"] = asyncio.create_task(
-        _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue)
+        _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace)
     )
 
 
-async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue):
+async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=0.5):
     """
-    Wait a short grace period. If still quiet (not speaking, queue empty) and
+    Wait `grace` seconds. If still quiet (not speaking, queue empty) and
     a buffer is waiting, fire the LLM. Prevents a held buffer from being
     stranded when no further audio arrives to re-trigger process_turn.
     """
-    SAFETY_GRACE = 2.0
     try:
-        await asyncio.sleep(SAFETY_GRACE)
+        await asyncio.sleep(grace)
 
         if stop_event.is_set():
             return
@@ -546,8 +610,7 @@ async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_qu
         if not full_user_text:
             return  # buffer already flushed by normal flow
 
-        log.info(f"[SAFETY] Flushing stranded buffer after {SAFETY_GRACE}s quiet: "
-                 f"'{full_user_text[:50]}...'")
+        log.info(f"[SAFETY] Flushing buffer after {grace}s quiet: '{full_user_text[:50]}...'")
         await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
 
     except asyncio.CancelledError:
@@ -560,59 +623,67 @@ async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_qu
 async def _commit_and_respond(websocket, session_id, state, full_user_text, turn_number):
     """
     Commit the buffer to history, call the LLM, send + speak the reply.
-    Shared by the normal flow and the safety-flush fallback so the LLM
-    call logic lives in exactly one place (no duplication, no drift).
+    Shared by the normal flow and the safety-flush fallback.
+
+    DOUBLE-FIRE GUARD: a synchronous is_responding flag set before any await
+    so the normal path and the safety flush can't both call the LLM (which
+    previously caused a duplicate call and a 429 rate limit).
     """
-    # Re-read state fresh to avoid acting on a stale snapshot, then
-    # double-check the buffer is still present (normal flow may have won the race)
-    raw = await redis_client.get(session_id)
-    if not raw:
+    slot = session_tasks.setdefault(session_id, {})
+    if slot.get("is_responding"):
+        log.info("[GUARD] Already responding — skipping duplicate LLM call")
         return
-    state = json.loads(raw)
-    full_user_text = state.get("turn_buffer", "").strip()
-    if not full_user_text:
-        return  # someone already committed this turn
+    slot["is_responding"] = True
 
-    state["history"].append({"role": "user", "content": full_user_text})
-    state["turn_buffer"] = ""
-    await redis_client.set(session_id, json.dumps(state))
+    try:
+        # Re-read state fresh, double-check buffer still present
+        raw = await redis_client.get(session_id)
+        if not raw:
+            return
+        state = json.loads(raw)
+        full_user_text = state.get("turn_buffer", "").strip()
+        if not full_user_text:
+            return  # someone already committed this turn
 
-    await websocket.send_json({"type": "STATUS", "message": "thinking"})
+        state["history"].append({"role": "user", "content": full_user_text})
+        state["turn_buffer"] = ""
+        await redis_client.set(session_id, json.dumps(state))
 
-    recent_history = state["history"][-(MAX_HISTORY_TURNS * 2):]
+        await websocket.send_json({"type": "STATUS", "message": "thinking"})
 
-    # Compute time remaining so the LLM can pace itself (wind down, invite
-    # candidate questions in the last 2 min, etc.)
-    accumulated = state.get("accumulated_seconds", 0)
-    time_remaining = max(0, INTERVIEW_DURATION_SECONDS - accumulated)
+        recent_history = state["history"][-(MAX_HISTORY_TURNS * 2):]
 
-    with track_turn(session_id, turn_number) as log_metrics:
-        result = await run_turn(
-            user_text=full_user_text,
-            history=recent_history,
-            summary=state.get("summary", ""),
-            time_remaining=time_remaining,
-        )
-        log_metrics.metrics(
-            tokens=result["tokens_used"],
-            rag_used=result["rag_used"],
-        )
+        accumulated = state.get("accumulated_seconds", 0)
+        time_remaining = max(0, INTERVIEW_DURATION_SECONDS - accumulated)
 
-    ai_text     = result["response"]
-    tokens_used = result["tokens_used"]
-    log.info(f"[TURN {turn_number}] reply='{ai_text[:60]}...'")
+        with track_turn(session_id, turn_number) as log_metrics:
+            result = await run_turn(
+                user_text=full_user_text,
+                history=recent_history,
+                summary=state.get("summary", ""),
+                time_remaining=time_remaining,
+            )
+            log_metrics.metrics(
+                tokens=result["tokens_used"],
+                rag_used=result["rag_used"],
+            )
 
-    state["tokens_total"] = state.get("tokens_total", 0) + tokens_used
-    state["history"].append({"role": "assistant", "content": ai_text})
-    await redis_client.set(session_id, json.dumps(state))
+        ai_text     = result["response"]
+        tokens_used = result["tokens_used"]
+        log.info(f"[TURN {turn_number}] reply='{ai_text[:60]}...'")
 
-    await websocket.send_json({"type": "AI_REPLY", "text": ai_text})
-    await send_response_for_speech(websocket, session_id, ai_text)
+        state["tokens_total"] = state.get("tokens_total", 0) + tokens_used
+        state["history"].append({"role": "assistant", "content": ai_text})
+        await redis_client.set(session_id, json.dumps(state))
 
-    if len(state["history"]) > MAX_HISTORY_TURNS:
-        session_tasks.setdefault(session_id, {})["summary_task"] = asyncio.create_task(
-            update_summary(session_id)
-        )
+        await websocket.send_json({"type": "AI_REPLY", "text": ai_text})
+        await send_response_for_speech(websocket, session_id, ai_text)
+
+        if len(state["history"]) > MAX_HISTORY_TURNS:
+            slot["summary_task"] = asyncio.create_task(update_summary(session_id))
+
+    finally:
+        slot["is_responding"] = False
 
 
 @app.websocket("/ws")
@@ -666,13 +737,13 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
 
     session_tasks[session_id] = {"summary_task": None, "timer_task": None,
                                  "llm_task": None, "safety_flush": None,
-                                 "is_speaking": False}
+                                 "is_speaking": False, "is_responding": False}
 
     start_session_run(session_id, email)
 
     if not state["history"]:
         opening = (f"Hi {name or 'there'}, I'm Sarah. Thanks for taking the time today. "
-                   f"To start — could you walk me through your background and what drew you to this role?")
+                   f"To start could you walk me through your background and what drew you to this role?")
         state["history"].append({"role": "assistant", "content": opening})
         await redis_client.set(session_id, json.dumps(state))
         await asyncio.sleep(0.2)
@@ -824,13 +895,13 @@ def _new_state() -> dict:
         "last_user_msg_time":  0,
         "turn_buffer":         "",
     }
+
+
 @app.get("/test-llm")
 async def test_llm():
     """Quick endpoint to verify LLM connection and token"""
     try:
         from llm_provider import llm_chat, get_fast_model
-        
-        # We ask it a simple question using your exact app setup
         reply, _ = await llm_chat(
             messages=[{"role": "user", "content": "Say about: 'LLM !'"}],
             model=get_fast_model(),
