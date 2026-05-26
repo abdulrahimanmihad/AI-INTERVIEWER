@@ -13,6 +13,8 @@ load_dotenv()
 RAG_METHOD: str = os.getenv("RAG_METHOD", "agentic")
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")
 
+POCKET_TTS_URL: str   = os.getenv("POCKET_TTS_URL", "http://localhost:8001/tts")
+POCKET_TTS_VOICE: str = os.getenv("POCKET_TTS_VOICE", "alba")
 # API KEYS — one per provider, only the active one needs to be set
 
 OPENAI_API_KEY:   str = os.getenv("OPENAI_API_KEY", "")
@@ -78,7 +80,7 @@ SAMPLE_RATE: int        = 16000
 FRAME_DURATION_MS: int  = 30
 
 SILENCE_TRIGGER_MS: int = 800
-VAD_AGGRESSIVENESS: int = 2
+VAD_AGGRESSIVENESS: int = 3
 
 FRAME_BYTES: int      = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
 SILENCE_FRAMES: int   = SILENCE_TRIGGER_MS // FRAME_DURATION_MS

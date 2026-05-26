@@ -19,6 +19,9 @@ import webrtcvad
 import whisper
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
+import httpx
+import base64
+import re
 from fastapi.staticfiles import StaticFiles
 
 
@@ -32,6 +35,7 @@ from config import (
     STT_PROVIDER,
     MAX_TOKENS_SUMMARY,
     INTERVIEW_DURATION_SECONDS,
+    POCKET_TTS_URL, POCKET_TTS_VOICE,
     INTERVIEW_WARNING_SECONDS,
 )
 from database import init_db, check_interview_status, register_new_user, archive_interview
@@ -41,6 +45,7 @@ from observability import track_turn, start_session_run, end_session_run
 from llm_provider import llm_chat, get_fast_model
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+http_client = httpx.AsyncClient(timeout=30.0)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -71,6 +76,12 @@ async def startup():
     log.info("=" * 60)
     await init_db()
     load_knowledge_base("./docs")
+    try:
+       async with httpx.AsyncClient(timeout=30.0) as client:
+        await client.post(POCKET_TTS_URL, data={"text": "Hello", "voice_url": POCKET_TTS_VOICE})
+       log.info("[TTS] Pocket TTS warmed up")
+    except Exception as e:
+      log.warning(f"[TTS] warmup failed: {e}")
     log.info("Ready.")
 
 
@@ -103,7 +114,7 @@ def _whisper_transcribe(audio_bytes: bytes) -> str:
 
     # Energy gate BEFORE the API call — don't pay to transcribe silence
     avg_energy = np.abs(audio_int16).mean()
-    if avg_energy < 160:
+    if avg_energy < 180:
         log.info(f"[STT] Skipping low-energy audio (energy={avg_energy:.0f})")
         return ""
 
@@ -153,7 +164,7 @@ def _whisper_transcribe(audio_bytes: bytes) -> str:
     HALLUCINATION_PHRASES = {
         "thank you for watching",
         "subscribe", "please subscribe", "subscribe to my channel",
-        "like and subscribe",
+        "like and subscribe","thank you"
     }
     if text_lower in HALLUCINATION_PHRASES:
         log.info(f"[STT] Hallucination phrase rejected: '{text}'")
@@ -196,7 +207,7 @@ def _is_thought_complete(text: str) -> bool:
     DANGLING_WORDS = {
         "and", "but", "or", "so", "because", "however", "although", "though",
         "while", "since", "if", "when", "as", "which", "who",
-        "the", "a", "an", "my", "your", "our", "their", "his", "her", "its",
+        "the", "a", "an", "my", "our", "their", "his", "her", "its",
         "to", "of", "for", "in", "on", "at", "with", "from", "by", "about",
         "i", "we", "they", "he", "she", "you",
         "is", "are", "was", "were", "will", "would", "can", "could", "should",
@@ -233,13 +244,69 @@ async def _auto_release_speaking_lock(session_id: str, duration_seconds: float):
         log.info(f"[STATE] {session_id}: TTS auto-released after {duration_seconds:.1f}s")
 
 
+def _split_sentences(text: str) -> list[str]:
+    """Split into sentences for incremental TTS. Keeps the punctuation."""
+    # split on . ? ! followed by space; keep short trailing bits merged
+    parts = re.split(r'(?<=[.,!?;:])\s+', text.strip())
+    # merge very short fragments into the previous sentence so we don't
+    # generate audio for "Yes." style one-word pieces separately
+    sentences = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if sentences and len(p) < 15:
+            sentences[-1] += " " + p
+        else:
+            sentences.append(p)
+    return sentences or [text.strip()]
+
+async def _pocket_tts_wav(text: str) -> bytes:
+    resp = await http_client.post(
+        POCKET_TTS_URL,
+        data={"text": text, "voice_url": POCKET_TTS_VOICE},
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
 async def send_response_for_speech(websocket: WebSocket, session_id: str, text: str):
     if not text or not text.strip():
         return
+
     ai_speaking_sessions.add(session_id)
-    await websocket.send_json({"type": "SPEAK", "text": text})
+
+    sentences = _split_sentences(text)
+    try:
+        for i, sentence in enumerate(sentences):
+            # If the user barged in, this session was discarded from the set —
+            # stop generating the rest of the sentences immediately.
+            if session_id not in ai_speaking_sessions:
+                log.info(f"[TTS] Barge-in detected mid-reply, stopping after sentence {i}")
+                break
+
+            wav_bytes = await _pocket_tts_wav(sentence)
+            wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
+
+            # is_last lets the frontend know when to fire TTS_DONE
+            await websocket.send_json({
+                "type":    "SPEAK_AUDIO",
+                "audio":   wav_b64,
+                "is_last": (i == len(sentences) - 1),
+            })
+
+    except Exception as e:
+        log.error(f"[TTS] Pocket TTS failed: {e}")
+        await websocket.send_json({"type": "SPEAK", "text": text})  # browser fallback
+        return
+
+    # failsafe lock release — generous, only catches a truly stuck browser.
+    # Real release comes from the browser's TTS_DONE on the last sentence.
+    # We add generation time (sentences render sequentially) + playback time.
     word_count = len(text.split())
-    estimated_seconds = (word_count / 2.5) + 2.0
+    num_sentences = len(sentences)
+    # ~1s render per sentence + speaking time + buffer
+    estimated_seconds = (num_sentences * 1.5) + (word_count / 2.5) + 3.0
     asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
 
 #USED FOR LISTENING

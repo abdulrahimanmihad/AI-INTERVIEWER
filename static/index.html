@@ -188,7 +188,7 @@ let speechFrameCount = 0;
 let localRemainingSecs = 0;
 let timerIntervalId    = null;
 let timerRunning       = false;
-
+let currentUserBubble = null;
 // ─── BUG 1 FIX: status reset timer ──────────────────────────────
 // Used to auto-revert stuck "listening" status back to idle
 // if no real transcription follows within 2.5 seconds.
@@ -197,7 +197,10 @@ let statusResetTimer = null;
 // Track current pipeline status as a variable — DOM className isn't reliable
 // because setStatus doesn't update the DOM synchronously for our check.
 let currentStatus = '';
-
+// audio queue for sentence-by-sentence playback
+let audioQueue = [];
+let isPlayingQueue = false;
+let currentAudio = null;
 // ─── INIT BROWSER VOICES ──────────────────────────────────────────
 // Pick a natural-sounding English voice when available
 function initVoices() {
@@ -269,14 +272,59 @@ function speak(text) {
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
 }
+let lastSentenceReceived = false;
 
+function enqueueAudio(b64, isLast) {
+  if (isLast) lastSentenceReceived = true;
+  audioQueue.push({ b64, isLast });
+  if (!isPlayingQueue) playNextInQueue();
+}
+
+function playNextInQueue() {
+  if (audioQueue.length === 0) {
+    isPlayingQueue = false;
+    // Only finish if we've actually received the last sentence.
+    // Otherwise the next chunk is still generating — wait for it.
+    if (lastSentenceReceived) {
+      lastSentenceReceived = false;
+      setStatus('Your turn — speak now', 'listening');
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "TTS_DONE" }));
+      }
+    }
+    return;
+  }
+  isPlayingQueue = true;
+  setStatus('Sarah is speaking...', 'speaking');
+
+  const { b64 } = audioQueue.shift();
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob  = new Blob([bytes], { type: 'audio/wav' });
+  const url   = URL.createObjectURL(blob);
+
+  currentAudio = new Audio(url);
+  currentAudio.onended = () => {
+    URL.revokeObjectURL(url);
+    currentAudio = null;
+    playNextInQueue();   // either next chunk, or finish-check above
+  };
+  currentAudio.onerror = () => {
+    URL.revokeObjectURL(url);
+    currentAudio = null;
+    playNextInQueue();
+  };
+  currentAudio.play();
+}
 // ─── ADDED: STOP TTS PLAYBACK (called when backend confirms interrupt) ──
 function stopSpeaking() {
+  audioQueue = [];
+  isPlayingQueue = false;
+  lastSentenceReceived = false;   // ← add this
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
   window.speechSynthesis.cancel();
   currentUtterance = null;
   currentSpokenText = "";
 }
-
 // ─── UI HELPERS ───────────────────────────────────────────────────
 function setStatus(text, type = '') {
   statusEl.textContent = text;
@@ -390,6 +438,20 @@ async function connectAndStart(name, email) {
     setStatus('Connection error');
   };
 }
+function updateUserBubble(text) {
+  if (currentUserBubble) {
+    // same turn still building — update the existing bubble
+    currentUserBubble.querySelector('.bubble-text').textContent = text;
+  } else {
+    // new turn — create a fresh bubble
+    const div = document.createElement('div');
+    div.className = 'turn user';
+    div.innerHTML = `<div class="role">You</div><div class="bubble-text">${text}</div>`;
+    transcriptEl.appendChild(div);
+    currentUserBubble = div;
+  }
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
 
 function handleMessage(msg) {
   switch (msg.type) {
@@ -425,13 +487,17 @@ function handleMessage(msg) {
       }
       break;
     case 'TRANSCRIPT':
-      addTurn('user', msg.text);
+      updateUserBubble(msg.text);
       break;
     case 'AI_REPLY':
-      addTurn('ai', msg.text);
-      break;
+     currentUserBubble = null;   // ← user's turn is done, next input = new bubble
+     addTurn('ai', msg.text);
+     break;
     case 'SPEAK':
       speak(msg.text);
+      break;
+    case 'SPEAK_AUDIO':
+      enqueueAudio(msg.audio, msg.is_last);
       break;
     case 'RESUME':
       addTurn('ai', msg.message);
@@ -496,7 +562,7 @@ async function setupAudio() {
     // ─── ADDED: BARGE-IN / INTERRUPT DETECTION ────────────────────
     // If Sarah is currently speaking and the user starts talking,
     // detect speech energy in the audio buffer and send INTERRUPT
-    if (window.speechSynthesis.speaking && currentUtterance) {
+    if (currentAudio && !currentAudio.paused)  {
       const samples = new Int16Array(event.data);
       // Simple energy threshold: if average absolute amplitude > threshold,
       // assume the user is speaking (not just background noise)
