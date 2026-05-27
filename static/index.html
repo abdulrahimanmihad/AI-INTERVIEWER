@@ -197,10 +197,13 @@ let statusResetTimer = null;
 // Track current pipeline status as a variable — DOM className isn't reliable
 // because setStatus doesn't update the DOM synchronously for our check.
 let currentStatus = '';
-// audio queue for sentence-by-sentence playback
-let audioQueue = [];
-let isPlayingQueue = false;
-let currentAudio = null;
+
+let streamAudioCtx   = null;   // dedicated context for playback
+let streamPlayTime   = 0;      // next scheduled start time (gapless)
+let streamHeaderDone = false;  // parsed the 44-byte WAV header yet?
+let streamSampleRate = 24000;  // updated from the header
+let streamActive     = false;  // are we mid-stream?
+let scheduledSources = [];     // so barge-in can stop them
 // ─── INIT BROWSER VOICES ──────────────────────────────────────────
 // Pick a natural-sounding English voice when available
 function initVoices() {
@@ -272,56 +275,92 @@ function speak(text) {
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
 }
-let lastSentenceReceived = false;
-
-function enqueueAudio(b64, isLast) {
-  if (isLast) lastSentenceReceived = true;
-  audioQueue.push({ b64, isLast });
-  if (!isPlayingQueue) playNextInQueue();
-}
-
-function playNextInQueue() {
-  if (audioQueue.length === 0) {
-    isPlayingQueue = false;
-    // Only finish if we've actually received the last sentence.
-    // Otherwise the next chunk is still generating — wait for it.
-    if (lastSentenceReceived) {
-      lastSentenceReceived = false;
-      setStatus('Your turn — speak now', 'listening');
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "TTS_DONE" }));
-      }
-    }
-    return;
+function audioStart() {
+  // fresh stream
+  stopStreamPlayback();        // clear anything previous
+  if (!streamAudioCtx) {
+    streamAudioCtx = new AudioContext();
   }
-  isPlayingQueue = true;
+  streamPlayTime   = streamAudioCtx.currentTime + 0.05;
+  streamHeaderDone = false;
+  streamActive     = true;
   setStatus('Sarah is speaking...', 'speaking');
-
-  const { b64 } = audioQueue.shift();
-  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-  const blob  = new Blob([bytes], { type: 'audio/wav' });
-  const url   = URL.createObjectURL(blob);
-
-  currentAudio = new Audio(url);
-  currentAudio.onended = () => {
-    URL.revokeObjectURL(url);
-    currentAudio = null;
-    playNextInQueue();   // either next chunk, or finish-check above
-  };
-  currentAudio.onerror = () => {
-    URL.revokeObjectURL(url);
-    currentAudio = null;
-    playNextInQueue();
-  };
-  currentAudio.play();
 }
+
+function handleAudioChunk(arrayBuffer) {
+  if (!streamActive || !streamAudioCtx) return;
+
+  let bytes = new Uint8Array(arrayBuffer);
+
+  // The very first chunk carries the 44-byte WAV header. Read the real
+  // sample rate from it (bytes 24-27), then strip the header.
+  if (!streamHeaderDone) {
+    if (bytes.length < 44) return;  // wait for a full header
+    const dv = new DataView(arrayBuffer);
+    streamSampleRate = dv.getUint32(24, true) || 24000;
+    bytes = bytes.subarray(44);     // drop header, rest is PCM16
+    streamHeaderDone = true;
+  }
+
+  if (bytes.length < 2) return;
+
+  // PCM16 -> Float32
+  const sampleCount = Math.floor(bytes.length / 2);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
+  const f32 = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    f32[i] = dv.getInt16(i * 2, true) / 32768;
+  }
+
+  const buffer = streamAudioCtx.createBuffer(1, sampleCount, streamSampleRate);
+  buffer.getChannelData(0).set(f32);
+
+  const src = streamAudioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(streamAudioCtx.destination);
+
+  // schedule gaplessly after the previous chunk
+  const startAt = Math.max(streamPlayTime, streamAudioCtx.currentTime);
+  src.start(startAt);
+  streamPlayTime = startAt + buffer.duration;
+
+  scheduledSources.push(src);
+  src.onended = () => {
+    scheduledSources = scheduledSources.filter(s => s !== src);
+  };
+}
+
+function audioEnd() {
+  // All chunks received. When the last scheduled chunk finishes, hand the
+  // turn back to the user and tell the backend we're done speaking.
+  if (!streamAudioCtx) { finishSpeaking(); return; }
+  const remaining = streamPlayTime - streamAudioCtx.currentTime;
+  const waitMs = Math.max(0, remaining * 1000);
+  setTimeout(() => {
+    if (streamActive) finishSpeaking();
+  }, waitMs + 50);
+}
+
+function finishSpeaking() {
+  streamActive = false;
+  setStatus('Your turn — speak now', 'listening');
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "TTS_DONE" }));
+  }
+}
+
+function stopStreamPlayback() {
+  // barge-in / cleanup: stop everything scheduled
+  scheduledSources.forEach(s => { try { s.stop(); } catch (e) {} });
+  scheduledSources = [];
+  streamActive     = false;
+  streamHeaderDone = false;
+}
+
 // ─── ADDED: STOP TTS PLAYBACK (called when backend confirms interrupt) ──
 function stopSpeaking() {
-  audioQueue = [];
-  isPlayingQueue = false;
-  lastSentenceReceived = false;   // ← add this
-  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-  window.speechSynthesis.cancel();
+  stopStreamPlayback();
+  window.speechSynthesis.cancel();   // fallback path
   currentUtterance = null;
   currentSpokenText = "";
 }
@@ -424,8 +463,13 @@ async function connectAndStart(name, email) {
     await setupAudio();
   };
 
+  socket.binaryType = "arraybuffer";
   socket.onmessage = (event) => {
-    handleMessage(JSON.parse(event.data));
+    if (typeof event.data === "string") {
+      handleMessage(JSON.parse(event.data));   // JSON control messages
+    } else {
+      handleAudioChunk(event.data);            // binary WAV chunks
+    }
   };
 
   socket.onclose = () => {
@@ -496,8 +540,11 @@ function handleMessage(msg) {
     case 'SPEAK':
       speak(msg.text);
       break;
-    case 'SPEAK_AUDIO':
-      enqueueAudio(msg.audio, msg.is_last);
+    case 'AUDIO_START':
+      audioStart();
+      break;
+    case 'AUDIO_END':
+      audioEnd();
       break;
     case 'RESUME':
       addTurn('ai', msg.message);
@@ -562,7 +609,7 @@ async function setupAudio() {
     // ─── ADDED: BARGE-IN / INTERRUPT DETECTION ────────────────────
     // If Sarah is currently speaking and the user starts talking,
     // detect speech energy in the audio buffer and send INTERRUPT
-    if (currentAudio && !currentAudio.paused)  {
+    if (streamActive) {
       const samples = new Int16Array(event.data);
       // Simple energy threshold: if average absolute amplitude > threshold,
       // assume the user is speaking (not just background noise)

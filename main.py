@@ -114,7 +114,7 @@ def _whisper_transcribe(audio_bytes: bytes) -> str:
 
     # Energy gate BEFORE the API call — don't pay to transcribe silence
     avg_energy = np.abs(audio_int16).mean()
-    if avg_energy < 180:
+    if avg_energy < 300:
         log.info(f"[STT] Skipping low-energy audio (energy={avg_energy:.0f})")
         return ""
 
@@ -244,69 +244,56 @@ async def _auto_release_speaking_lock(session_id: str, duration_seconds: float):
         log.info(f"[STATE] {session_id}: TTS auto-released after {duration_seconds:.1f}s")
 
 
-def _split_sentences(text: str) -> list[str]:
-    """Split into sentences for incremental TTS. Keeps the punctuation."""
-    # split on . ? ! followed by space; keep short trailing bits merged
-    parts = re.split(r'(?<=[.,!?;:])\s+', text.strip())
-    # merge very short fragments into the previous sentence so we don't
-    # generate audio for "Yes." style one-word pieces separately
-    sentences = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        if sentences and len(p) < 15:
-            sentences[-1] += " " + p
-        else:
-            sentences.append(p)
-    return sentences or [text.strip()]
-
-async def _pocket_tts_wav(text: str) -> bytes:
-    resp = await http_client.post(
-        POCKET_TTS_URL,
-        data={"text": text, "voice_url": POCKET_TTS_VOICE},
-    )
-    resp.raise_for_status()
-    return resp.content
-
-
 async def send_response_for_speech(websocket: WebSocket, session_id: str, text: str):
+    """
+    STREAMING TTS. The LLM has already produced the full `text` (LangGraph/RAG
+    is untouched). We stream Pocket TTS's WAV bytes to the browser as they
+    render — first audio in ~90ms instead of waiting ~5s for the whole clip.
+
+    Protocol over the WebSocket:
+      AUDIO_START (json)  -> browser prepares a fresh streaming player
+      <binary frames>     -> raw WAV bytes (header in the first frame)
+      AUDIO_END   (json)  -> browser knows no more chunks are coming
+    Barge-in: if the session leaves ai_speaking_sessions mid-stream, we stop
+    forwarding chunks immediately.
+    """
     if not text or not text.strip():
         return
 
     ai_speaking_sessions.add(session_id)
 
-    sentences = _split_sentences(text)
     try:
-        for i, sentence in enumerate(sentences):
-            # If the user barged in, this session was discarded from the set —
-            # stop generating the rest of the sentences immediately.
-            if session_id not in ai_speaking_sessions:
-                log.info(f"[TTS] Barge-in detected mid-reply, stopping after sentence {i}")
-                break
+        await websocket.send_json({"type": "AUDIO_START"})
 
-            wav_bytes = await _pocket_tts_wav(sentence)
-            wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
+        async with http_client.stream(
+            "POST",
+            POCKET_TTS_URL,
+            data={"text": text, "voice_url": POCKET_TTS_VOICE},
+        ) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(chunk_size=4096):
+                # Barge-in: session was discarded -> stop streaming now
+                if session_id not in ai_speaking_sessions:
+                    log.info("[TTS] Barge-in mid-stream, stopping audio")
+                    break
+                if chunk:
+                    await websocket.send_bytes(chunk)
 
-            # is_last lets the frontend know when to fire TTS_DONE
-            await websocket.send_json({
-                "type":    "SPEAK_AUDIO",
-                "audio":   wav_b64,
-                "is_last": (i == len(sentences) - 1),
-            })
+        await websocket.send_json({"type": "AUDIO_END"})
 
     except Exception as e:
-        log.error(f"[TTS] Pocket TTS failed: {e}")
-        await websocket.send_json({"type": "SPEAK", "text": text})  # browser fallback
+        log.error(f"[TTS] Pocket TTS stream failed: {e}")
+        # fallback: browser speaks the text so the interview never stalls
+        try:
+            await websocket.send_json({"type": "SPEAK", "text": text})
+        except Exception:
+            pass
         return
 
-    # failsafe lock release — generous, only catches a truly stuck browser.
-    # Real release comes from the browser's TTS_DONE on the last sentence.
-    # We add generation time (sentences render sequentially) + playback time.
+    # failsafe lock release — the real release is the browser's TTS_DONE
+    # once playback finishes. This only catches a stuck browser.
     word_count = len(text.split())
-    num_sentences = len(sentences)
-    # ~1s render per sentence + speaking time + buffer
-    estimated_seconds = (num_sentences * 1.5) + (word_count / 2.5) + 3.0
+    estimated_seconds = (word_count / 2.5) + 12.0
     asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
 
 #USED FOR LISTENING
