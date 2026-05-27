@@ -532,11 +532,10 @@ async def deepgram_receiver_loop(websocket, session_id, audio_queue, stop_event)
             if not item:
                 continue
             kind, text = item
-            if session_id in ai_speaking_sessions and text.strip():
-                ai_speaking_sessions.discard(session_id)
-                try: await websocket.send_json({"type": "STOP_SPEAKING"})
-                except Exception: pass
-                log.info("[DG] barge-in detected")
+            # While Sarah speaks, ignore Deepgram transcripts (they're echo of
+            # her own voice). Real barge-in comes from the frontend INTERRUPT.
+            if session_id in ai_speaking_sessions:
+                continue
             if kind == "interim":
                 try:
                     await websocket.send_json({"type": "STATUS", "message": "transcribing"})
@@ -614,11 +613,14 @@ async def turn_processor_loop(
                 turn_number += 1
                 await _commit_text_turn(websocket, session_id, payload, turn_number)
             if kind == "interim":
+                # don't update the bubble on every interim — it flickers/replaces.
+                # just show the status.
                 try:
                     await websocket.send_json({"type": "STATUS", "message": "transcribing"})
-                    await websocket.send_json({"type": "TRANSCRIPT", "text": payload})
                 except Exception:
                     pass
+            elif kind == "final":
+                await audio_queue.put(("text", text))
         except Exception as e:
             log.error(f"[FATAL ERROR] The background processor crashed: {e}", exc_info=True)
             try:
@@ -902,26 +904,57 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
 
 async def _commit_text_turn(websocket, session_id, text, turn_number):
     """
-    Deepgram path: Flux already finalized the turn, so commit the transcript
-    straight into the buffer and respond. No re-transcription, no
-    _is_thought_complete (Flux handled turn detection).
+    Deepgram path: Flux finalized a turn. But people pause mid-thought, so
+    instead of responding instantly we merge into the buffer and wait a short
+    grace period. If the user continues (another EndOfTurn arrives), we merge
+    and reset the timer. Only when they stay quiet do we respond.
     """
     raw = await redis_client.get(session_id)
     if not raw:
         return
     state = json.loads(raw)
 
-    # merge into buffer (keeps your afterthought-merge behavior if Flux
-    # sends two quick turns)
+    # merge this utterance into the buffer (handles pause-and-continue)
     existing = state.get("turn_buffer", "").strip()
     state["turn_buffer"] = f"{existing} {text}".strip() if existing else text
     await redis_client.set(session_id, json.dumps(state))
     await websocket.send_json({"type": "TRANSCRIPT", "text": state["turn_buffer"]})
 
-    full_user_text = state["turn_buffer"].strip()
-    if full_user_text:
-        await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
+    # schedule a grace-delayed response; if another turn arrives, it cancels
+    # and reschedules, so a pause-and-continue merges instead of double-firing
+    _schedule_dg_flush(websocket, session_id, turn_number)
 
+
+def _schedule_dg_flush(websocket, session_id, turn_number):
+    slot = session_tasks.setdefault(session_id, {})
+    old = slot.get("dg_flush")
+    if old and not old.done():
+        old.cancel()
+    slot["dg_flush"] = asyncio.create_task(
+        _dg_flush(websocket, session_id, turn_number)
+    )
+
+
+async def _dg_flush(websocket, session_id, turn_number, grace=1.2):
+    """Wait `grace` seconds after the last EndOfTurn. If no new speech arrived
+    (this task wasn't cancelled), respond. This gives the user room to pause
+    and continue without the AI cutting in."""
+    try:
+        await asyncio.sleep(grace)
+        raw = await redis_client.get(session_id)
+        if not raw:
+            return
+        state = json.loads(raw)
+        full_user_text = state.get("turn_buffer", "").strip()
+        if not full_user_text:
+            return
+        log.info(f"[DG] grace elapsed, responding: '{full_user_text[:50]}...'")
+        await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
+    except asyncio.CancelledError:
+        # user continued — a new EndOfTurn rescheduled us. Don't respond yet.
+        raise
+    except Exception as e:
+        log.error(f"[DG] flush error: {e}", exc_info=True)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = ""):
@@ -1031,7 +1064,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
         log.error(f"[WS] Crash: {e}", exc_info=True)
     finally:
         stop_event.set()
-        for key in ("summary_task", "timer_task", "llm_task", "safety_flush"):
+        for key in ("summary_task", "timer_task", "llm_task", "safety_flush", "dg_flush"):
             task = session_tasks.get(session_id, {}).get(key)
             if task and not task.done():
                 task.cancel()

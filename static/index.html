@@ -168,6 +168,9 @@ let mediaStream  = null;
 let workletNode  = null;
 let selectedVoice = null;
 
+let currentAiBubble = null;
+let pendingSentence = null;     // {words, bubbleSpan} waiting for its audio duration
+let wordRevealTimer = null;
 // ADDED: track what Sarah is currently saying so we can send "spoken_so_far"
 // on interrupt — backend needs this to know what was cut off
 let currentUtterance = null;
@@ -204,7 +207,7 @@ let streamHeaderDone = false;  // parsed the 44-byte WAV header yet?
 let streamSampleRate = 24000;  // updated from the header
 let streamActive     = false;  // are we mid-stream?
 let scheduledSources = [];     // so barge-in can stop them
-let currentAiBubble = null;
+
 // ─── INIT BROWSER VOICES ──────────────────────────────────────────
 // Pick a natural-sounding English voice when available
 function initVoices() {
@@ -359,8 +362,9 @@ function stopStreamPlayback() {
 
 // ─── ADDED: STOP TTS PLAYBACK (called when backend confirms interrupt) ──
 function stopSpeaking() {
+  if (wordRevealTimer) { clearTimeout(wordRevealTimer); wordRevealTimer = null; }
   stopStreamPlayback();
-  window.speechSynthesis.cancel();   // fallback path
+  window.speechSynthesis.cancel();
   currentUtterance = null;
   currentSpokenText = "";
 }
@@ -378,8 +382,8 @@ function addTurn(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-function appendAiSentence(text, isFirst) {
-  // isFirst -> start a new AI bubble; otherwise append to the current one
+function queueSentenceForReveal(text, isFirst) {
+  // start a fresh AI bubble on the first sentence of a reply
   if (isFirst || !currentAiBubble) {
     const div = document.createElement('div');
     div.className = 'turn ai';
@@ -388,8 +392,32 @@ function appendAiSentence(text, isFirst) {
     currentAiBubble = div;
   }
   const bubble = currentAiBubble.querySelector('.bubble-text');
-  bubble.textContent = (bubble.textContent ? bubble.textContent + " " : "") + text;
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+
+  // append a space if the bubble already has text
+  const prefix = bubble.textContent ? " " : "";
+  const words = text.split(/\s+/).filter(Boolean);
+
+  // store this sentence; the audio handler will trigger the timed reveal
+  // once it knows the duration. We reveal immediately at an estimated pace
+  // and let the audio duration correct it.
+  revealWordsProgressively(bubble, prefix, words);
+}
+
+function revealWordsProgressively(bubble, prefix, words, durationMs) {
+  // Estimate: ~380ms per word if we don't yet know the audio duration.
+  // When audio duration is known, we override with the real pace.
+  const perWord = durationMs ? (durationMs / words.length) : 380;
+  let i = 0;
+  if (prefix) bubble.textContent += prefix;
+
+  function step() {
+    if (i >= words.length) return;
+    bubble.textContent += (i > 0 ? " " : "") + words[i];
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    i++;
+    wordRevealTimer = setTimeout(step, perWord);
+  }
+  step();
 }
 
 // ─── ISSUE #1 FIX: TIMER RENDERING + LOCAL TICK ──────────────────
@@ -553,9 +581,9 @@ function handleMessage(msg) {
      addTurn('ai', msg.text);
      break;
     case 'SPEAK_SENTENCE':
-     currentUserBubble = null;
-     appendAiSentence(msg.text, msg.is_first);
-     break;
+      currentUserBubble = null;
+      queueSentenceForReveal(msg.text, msg.is_first);
+      break;
     case 'AUDIO_START':
       audioStart();
       break;
@@ -637,7 +665,7 @@ async function setupAudio() {
 
       // 800 is a reasonable threshold for "someone speaking close to mic"
       // Tune this if too sensitive (lower) or not sensitive enough (higher)
-      if (avgEnergy > 800) {
+      if (avgEnergy > 1300) {
         speechFrameCount++;
         // Need 3 consecutive loud frames to trigger (~90ms) — avoids false positives
         if (speechFrameCount >= 3) {
