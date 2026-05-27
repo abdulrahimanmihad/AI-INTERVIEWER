@@ -331,29 +331,28 @@ async def _pocket_stream_sentence(websocket: WebSocket, session_id: str, sentenc
         log.error(f"[TTS] sentence stream failed: {e}")
         return True
 
-
 async def stream_reply_synced(websocket: WebSocket, session_id: str, text: str):
     """
     SYNCED text+audio. For each sentence: reveal its text, then stream its
-    audio. Sarah's caption grows in step with her voice. The full reply is
-    built up sentence by sentence (fixes the old 'only first sentence text'
-    bug — every sentence's text is sent paired with its audio).
+    audio. Sarah's caption grows in step with her voice. Returns True if
+    barge-in cut the reply before all sentences played.
     """
     if not text or not text.strip():
-        return
+        return False
 
     ai_speaking_sessions.add(session_id)
     sentences = _split_sentences(text)
 
+    was_interrupted = False
     for i, sentence in enumerate(sentences):
+        # check BEFORE sending text — barge-in stops further text AND audio
         if session_id not in ai_speaking_sessions:
-            log.info(f"[TTS] barge-in, stopping at sentence {i}")
+            was_interrupted = True
             break
 
         is_first = (i == 0)
         is_last  = (i == len(sentences) - 1)
 
-        # 1. reveal this sentence's text (paired with its audio)
         await websocket.send_json({
             "type":     "SPEAK_SENTENCE",
             "text":     sentence,
@@ -361,17 +360,20 @@ async def stream_reply_synced(websocket: WebSocket, session_id: str, text: str):
             "is_last":  is_last,
         })
 
-        # 2. stream this sentence's audio
         ok = await _pocket_stream_sentence(websocket, session_id, sentence)
         if not ok:
+            was_interrupted = True
             break
 
     # signal the whole reply's audio is done -> frontend resumes listening
     await websocket.send_json({"type": "AUDIO_END"})
 
+    # failsafe lock release (real release is the browser's TTS_DONE)
     word_count = len(text.split())
-    estimated_seconds = (word_count / 2.5) + 12.0
+    estimated_seconds = (word_count / 2) + 100
     asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
+
+    return was_interrupted
 
 #USED FOR LISTENING
 async def vad_receiver_loop(
@@ -612,15 +614,6 @@ async def turn_processor_loop(
             elif kind == "text":
                 turn_number += 1
                 await _commit_text_turn(websocket, session_id, payload, turn_number)
-            if kind == "interim":
-                # don't update the bubble on every interim — it flickers/replaces.
-                # just show the status.
-                try:
-                    await websocket.send_json({"type": "STATUS", "message": "transcribing"})
-                except Exception:
-                    pass
-            elif kind == "final":
-                await audio_queue.put(("text", text))
         except Exception as e:
             log.error(f"[FATAL ERROR] The background processor crashed: {e}", exc_info=True)
             try:
@@ -891,12 +884,93 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
         log.info(f"[TURN {turn_number}] reply='{ai_text[:60]}...'")
 
         state["tokens_total"] = state.get("tokens_total", 0) + tokens_used
+        await redis_client.set(session_id, json.dumps(state))
+
+        # stream reply (synced sentence text + audio); returns True if barge-in cut it
+        was_interrupted = await stream_reply_synced(websocket, session_id, ai_text)
+
+        # persist assistant turn
+        raw = await redis_client.get(session_id)
+        state = json.loads(raw)
         state["history"].append({"role": "assistant", "content": ai_text})
         await redis_client.set(session_id, json.dumps(state))
 
-        await stream_reply_synced(websocket, session_id, ai_text)
+        # spawn summary ONLY on complete replies — avoids parallel LLM call
+        # on barged-in turns and prevents summary from reflecting cut speech
+        if not was_interrupted and len(state["history"]) > MAX_HISTORY_TURNS:
+            slot["summary_task"] = asyncio.create_task(update_summary(session_id))
 
-        if len(state["history"]) > MAX_HISTORY_TURNS:
+    finally:
+        slot["is_responding"] = False
+
+
+async def _commit_and_respond(websocket, session_id, state, full_user_text, turn_number):
+    """
+    Commit the buffer to history, call the LLM, send + speak the reply.
+    Shared by the normal flow and the safety-flush fallback.
+
+    DOUBLE-FIRE GUARD: a synchronous is_responding flag set before any await
+    so the normal path and the safety flush can't both call the LLM (which
+    previously caused a duplicate call and a 429 rate limit).
+    """
+    slot = session_tasks.setdefault(session_id, {})
+    if slot.get("is_responding"):
+        log.info("[GUARD] Already responding — skipping duplicate LLM call")
+        return
+    slot["is_responding"] = True
+
+    try:
+        # Re-read state fresh, double-check buffer still present
+        raw = await redis_client.get(session_id)
+        if not raw:
+            return
+        state = json.loads(raw)
+        full_user_text = state.get("turn_buffer", "").strip()
+        if not full_user_text:
+            return  # someone already committed this turn
+
+        state["history"].append({"role": "user", "content": full_user_text})
+        state["turn_buffer"] = ""
+        await redis_client.set(session_id, json.dumps(state))
+
+        await websocket.send_json({"type": "STATUS", "message": "thinking"})
+
+        recent_history = state["history"][-(MAX_HISTORY_TURNS * 2):]
+
+        accumulated = state.get("accumulated_seconds", 0)
+        time_remaining = max(0, INTERVIEW_DURATION_SECONDS - accumulated)
+
+        with track_turn(session_id, turn_number) as log_metrics:
+            result = await run_turn(
+                user_text=full_user_text,
+                history=recent_history,
+                summary=state.get("summary", ""),
+                time_remaining=time_remaining,
+            )
+            log_metrics.metrics(
+                tokens=result["tokens_used"],
+                rag_used=result["rag_used"],
+            )
+
+        ai_text     = result["response"]
+        tokens_used = result["tokens_used"]
+        log.info(f"[TURN {turn_number}] reply='{ai_text[:60]}...'")
+
+        state["tokens_total"] = state.get("tokens_total", 0) + tokens_used
+        await redis_client.set(session_id, json.dumps(state))
+
+        # stream reply (synced sentence text + audio); returns True if barge-in cut it
+        was_interrupted = await stream_reply_synced(websocket, session_id, ai_text)
+
+        # persist assistant turn
+        raw = await redis_client.get(session_id)
+        state = json.loads(raw)
+        state["history"].append({"role": "assistant", "content": ai_text})
+        await redis_client.set(session_id, json.dumps(state))
+
+        # spawn summary ONLY on complete replies — avoids parallel LLM call
+        # on barged-in turns and prevents summary from reflecting cut speech
+        if not was_interrupted and len(state["history"]) > MAX_HISTORY_TURNS:
             slot["summary_task"] = asyncio.create_task(update_summary(session_id))
 
     finally:
@@ -904,57 +978,32 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
 
 async def _commit_text_turn(websocket, session_id, text, turn_number):
     """
-    Deepgram path: Flux finalized a turn. But people pause mid-thought, so
-    instead of responding instantly we merge into the buffer and wait a short
-    grace period. If the user continues (another EndOfTurn arrives), we merge
-    and reset the timer. Only when they stay quiet do we respond.
+    Deepgram path: Flux finalized a turn. 
+    Instantly commits and responds to the user's text without any grace period.
     """
     raw = await redis_client.get(session_id)
     if not raw:
         return
     state = json.loads(raw)
 
-    # merge this utterance into the buffer (handles pause-and-continue)
+    # merge this utterance into the buffer
     existing = state.get("turn_buffer", "").strip()
-    state["turn_buffer"] = f"{existing} {text}".strip() if existing else text
+    full_user_text = f"{existing} {text}".strip() if existing else text
+    
+    state["turn_buffer"] = full_user_text
     await redis_client.set(session_id, json.dumps(state))
-    await websocket.send_json({"type": "TRANSCRIPT", "text": state["turn_buffer"]})
+    await websocket.send_json({"type": "TRANSCRIPT", "text": full_user_text})
 
-    # schedule a grace-delayed response; if another turn arrives, it cancels
-    # and reschedules, so a pause-and-continue merges instead of double-firing
-    _schedule_dg_flush(websocket, session_id, turn_number)
-
-
-def _schedule_dg_flush(websocket, session_id, turn_number):
-    slot = session_tasks.setdefault(session_id, {})
-    old = slot.get("dg_flush")
-    if old and not old.done():
-        old.cancel()
-    slot["dg_flush"] = asyncio.create_task(
-        _dg_flush(websocket, session_id, turn_number)
+    # --- CHANGED: Instantly call the response handler instead of scheduling a flush ---
+    await _commit_and_respond(
+        websocket=websocket, 
+        session_id=session_id, 
+        state=state, 
+        full_user_text=full_user_text, 
+        turn_number=turn_number
     )
 
 
-async def _dg_flush(websocket, session_id, turn_number, grace=1.2):
-    """Wait `grace` seconds after the last EndOfTurn. If no new speech arrived
-    (this task wasn't cancelled), respond. This gives the user room to pause
-    and continue without the AI cutting in."""
-    try:
-        await asyncio.sleep(grace)
-        raw = await redis_client.get(session_id)
-        if not raw:
-            return
-        state = json.loads(raw)
-        full_user_text = state.get("turn_buffer", "").strip()
-        if not full_user_text:
-            return
-        log.info(f"[DG] grace elapsed, responding: '{full_user_text[:50]}...'")
-        await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
-    except asyncio.CancelledError:
-        # user continued — a new EndOfTurn rescheduled us. Don't respond yet.
-        raise
-    except Exception as e:
-        log.error(f"[DG] flush error: {e}", exc_info=True)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = ""):

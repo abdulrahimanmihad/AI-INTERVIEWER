@@ -24,8 +24,8 @@ class DeepgramStream:
             model=DEEPGRAM_MODEL,
             encoding="linear16",
             sample_rate=SAMPLE_RATE,
-            eot_threshold=0.7,
-            eot_timeout_ms=5000,
+            eot_threshold=0.85,
+            eot_timeout_ms=7000,
         )
         self._conn = await self._conn_cm.__aenter__()
         self._conn.on(EventType.MESSAGE, self._on_message)

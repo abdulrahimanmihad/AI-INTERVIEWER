@@ -362,6 +362,7 @@ function stopStreamPlayback() {
 
 // ─── ADDED: STOP TTS PLAYBACK (called when backend confirms interrupt) ──
 function stopSpeaking() {
+  revealStopped = true;                               // ← stops any in-flight reveal
   if (wordRevealTimer) { clearTimeout(wordRevealTimer); wordRevealTimer = null; }
   stopStreamPlayback();
   window.speechSynthesis.cancel();
@@ -383,14 +384,15 @@ function addTurn(role, text) {
 }
 
 function queueSentenceForReveal(text, isFirst) {
-  // start a fresh AI bubble on the first sentence of a reply
   if (isFirst || !currentAiBubble) {
+    revealStopped = false;                            // ← new reply, allow reveal again
     const div = document.createElement('div');
     div.className = 'turn ai';
     div.innerHTML = `<div class="role">Sarah</div><div class="bubble-text"></div>`;
     transcriptEl.appendChild(div);
     currentAiBubble = div;
   }
+  // ... rest unchanged
   const bubble = currentAiBubble.querySelector('.bubble-text');
 
   // append a space if the bubble already has text
@@ -403,15 +405,15 @@ function queueSentenceForReveal(text, isFirst) {
   revealWordsProgressively(bubble, prefix, words);
 }
 
+let revealStopped = false;
+
 function revealWordsProgressively(bubble, prefix, words, durationMs) {
-  // Estimate: ~380ms per word if we don't yet know the audio duration.
-  // When audio duration is known, we override with the real pace.
   const perWord = durationMs ? (durationMs / words.length) : 380;
   let i = 0;
   if (prefix) bubble.textContent += prefix;
 
   function step() {
-    if (i >= words.length) return;
+    if (revealStopped || i >= words.length) return;   // ← check flag
     bubble.textContent += (i > 0 ? " " : "") + words[i];
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
     i++;
