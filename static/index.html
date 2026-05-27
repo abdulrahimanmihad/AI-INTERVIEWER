@@ -222,9 +222,6 @@ function initVoices() {
 window.speechSynthesis.onvoiceschanged = initVoices;
 initVoices();
 
-// ─── SPEAK USING BROWSER ──────────────────────────────────────────
-// This replaces the OpenAI TTS audio streaming
-// Zero API calls — uses the user's OS speech engine
 function speak(text) {
   if (!text) return;
 

@@ -23,6 +23,7 @@ import httpx
 import base64
 import re
 from fastapi.staticfiles import StaticFiles
+from deepgram_stt import DeepgramStream
 
 
 from config import (
@@ -434,6 +435,82 @@ async def vad_receiver_loop(
                 silence_count   = 0
                 speech_count    = 0
                 listening_sent  = False
+                
+async def deepgram_receiver_loop(websocket, session_id, audio_queue, stop_event):
+    dg = None
+
+    async def ensure_connected():
+        nonlocal dg
+        if dg is None:
+            dg = DeepgramStream()
+            await dg.start()
+            log.info("[DG] (re)connected")
+        return dg
+
+    async def pump_finals():
+        while not stop_event.is_set():
+            if dg is None:
+                await asyncio.sleep(0.1)
+                continue
+            item = await dg.get_final(timeout=1.0)
+            if not item:
+                continue
+            kind, text = item
+            if session_id in ai_speaking_sessions and text.strip():
+                ai_speaking_sessions.discard(session_id)
+                try: await websocket.send_json({"type": "STOP_SPEAKING"})
+                except Exception: pass
+                log.info("[DG] barge-in detected")
+            if kind == "interim":
+                try:
+                    await websocket.send_json({"type": "STATUS", "message": "transcribing"})
+                    await websocket.send_json({"type": "TRANSCRIPT", "text": text})
+                except Exception: pass
+            elif kind == "final":
+                await audio_queue.put(("text", text))
+
+    await ensure_connected()
+    finals_task = asyncio.create_task(pump_finals())
+
+    try:
+        while not stop_event.is_set():
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except (WebSocketDisconnect, RuntimeError):
+                break
+
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            if "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+                mt = data.get("type", "")
+                if mt == "INTERRUPT":
+                    if session_id in ai_speaking_sessions:
+                        ai_speaking_sessions.discard(session_id)
+                        await audio_queue.put(("interrupt", data.get("spoken_so_far", "")))
+                elif mt == "TTS_DONE":
+                    ai_speaking_sessions.discard(session_id)
+                continue
+
+            if "bytes" not in message:
+                continue
+
+            # if the Deepgram connection died, reconnect before sending
+            if dg is None or dg._conn is None:
+                dg = None
+                await ensure_connected()
+
+            await dg.send_audio(message["bytes"])
+    finally:
+        finals_task.cancel()
+        if dg is not None:
+            await dg.close()
 
 async def turn_processor_loop(
     websocket: WebSocket, session_id: str,
@@ -457,6 +534,15 @@ async def turn_processor_loop(
                 await process_turn(websocket, session_id, payload, stop_event, turn_number, audio_queue)
             elif kind == "partial":
                 await process_partial_audio(websocket, session_id, payload)
+            elif kind == "text":
+                turn_number += 1
+                await _commit_text_turn(websocket, session_id, payload, turn_number)
+            if kind == "interim":
+                try:
+                    await websocket.send_json({"type": "STATUS", "message": "transcribing"})
+                    await websocket.send_json({"type": "TRANSCRIPT", "text": payload})
+                except Exception:
+                    pass
         except Exception as e:
             log.error(f"[FATAL ERROR] The background processor crashed: {e}", exc_info=True)
             try:
@@ -739,6 +825,28 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
     finally:
         slot["is_responding"] = False
 
+async def _commit_text_turn(websocket, session_id, text, turn_number):
+    """
+    Deepgram path: Flux already finalized the turn, so commit the transcript
+    straight into the buffer and respond. No re-transcription, no
+    _is_thought_complete (Flux handled turn detection).
+    """
+    raw = await redis_client.get(session_id)
+    if not raw:
+        return
+    state = json.loads(raw)
+
+    # merge into buffer (keeps your afterthought-merge behavior if Flux
+    # sends two quick turns)
+    existing = state.get("turn_buffer", "").strip()
+    state["turn_buffer"] = f"{existing} {text}".strip() if existing else text
+    await redis_client.set(session_id, json.dumps(state))
+    await websocket.send_json({"type": "TRANSCRIPT", "text": state["turn_buffer"]})
+
+    full_user_text = state["turn_buffer"].strip()
+    if full_user_text:
+        await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = ""):
@@ -826,11 +934,17 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
     session_tasks[session_id]["timer_task"] = timer_task
 
     try:
-        results = await asyncio.gather(
-            vad_receiver_loop(websocket, session_id, audio_queue, stop_event),
-            turn_processor_loop(websocket, session_id, audio_queue, stop_event),
-            return_exceptions=True,
+        log.info(f"[STT] provider = {STT_PROVIDER!r}")
+        receiver = (
+        deepgram_receiver_loop if STT_PROVIDER == "deepgram"
+        else vad_receiver_loop
         )
+        results = await asyncio.gather(
+        receiver(websocket, session_id, audio_queue, stop_event),
+        turn_processor_loop(websocket, session_id, audio_queue, stop_event),
+        return_exceptions=True,
+          )
+        
         for r in results:
             if isinstance(r, WebSocketDisconnect):
                 log.info(f"[WS] {email} disconnected — state preserved for resume")

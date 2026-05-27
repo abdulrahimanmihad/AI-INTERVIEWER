@@ -49,8 +49,11 @@ OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small" #Paid
 LOCAL_EMBEDDING_MODEL: str  = "all-MiniLM-L6-v2"  
 
 #  WHISPER (Speech-to-Text)
-STT_PROVIDER = "groq"   # "local" or "groq"
+# "groq" = Groq Whisper (batch). "deepgram" = Deepgram streaming.
+STT_PROVIDER: str = os.getenv("STT_PROVIDER", "groq")
 
+DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL:   str = os.getenv("DEEPGRAM_MODEL", "flux-general-en")
 
 
 #  TTS (Text-to-Speech)
@@ -97,6 +100,7 @@ INTERVIEW_WARNING_SECONDS: int = 60
 CHUNK_SIZE: int    = 400
 CHUNK_OVERLAP: int = 80
 RAG_TOP_K: int     = 3
+
 
 #  POSTGRESQL (with SQLite fallback for local dev without PG)
 
