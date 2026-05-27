@@ -46,3 +46,5 @@ langsmith==0.1.142   # auto-traces when LANGSMITH_API_KEY is set
 
 #  Env vars 
 python-dotenv==1.0.1
+
+deepgram-sdk==7.2.0
