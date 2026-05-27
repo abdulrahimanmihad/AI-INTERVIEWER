@@ -204,6 +204,7 @@ let streamHeaderDone = false;  // parsed the 44-byte WAV header yet?
 let streamSampleRate = 24000;  // updated from the header
 let streamActive     = false;  // are we mid-stream?
 let scheduledSources = [];     // so barge-in can stop them
+let currentAiBubble = null;
 // ─── INIT BROWSER VOICES ──────────────────────────────────────────
 // Pick a natural-sounding English voice when available
 function initVoices() {
@@ -272,14 +273,16 @@ function speak(text) {
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
 }
+
 function audioStart() {
-  // fresh stream
-  stopStreamPlayback();        // clear anything previous
   if (!streamAudioCtx) {
     streamAudioCtx = new AudioContext();
   }
-  streamPlayTime   = streamAudioCtx.currentTime + 0.05;
-  streamHeaderDone = false;
+  // don't stop previous sentence — let it finish; just continue the timeline
+  if (!streamActive) {
+    streamPlayTime = streamAudioCtx.currentTime + 0.05;
+  }
+  streamHeaderDone = false;   // each sentence is its own WAV with its own header
   streamActive     = true;
   setStatus('Sarah is speaking...', 'speaking');
 }
@@ -372,6 +375,20 @@ function addTurn(role, text) {
   div.className = 'turn ' + role;
   div.innerHTML = `<div class="role">${role === 'user' ? 'You' : 'Sarah'}</div><div>${text}</div>`;
   transcriptEl.appendChild(div);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function appendAiSentence(text, isFirst) {
+  // isFirst -> start a new AI bubble; otherwise append to the current one
+  if (isFirst || !currentAiBubble) {
+    const div = document.createElement('div');
+    div.className = 'turn ai';
+    div.innerHTML = `<div class="role">Sarah</div><div class="bubble-text"></div>`;
+    transcriptEl.appendChild(div);
+    currentAiBubble = div;
+  }
+  const bubble = currentAiBubble.querySelector('.bubble-text');
+  bubble.textContent = (bubble.textContent ? bubble.textContent + " " : "") + text;
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
@@ -531,12 +548,14 @@ function handleMessage(msg) {
       updateUserBubble(msg.text);
       break;
     case 'AI_REPLY':
-     currentUserBubble = null;   // ← user's turn is done, next input = new bubble
+     currentUserBubble = null;
+     currentAiBubble = null;      // reset so a new AI bubble starts
      addTurn('ai', msg.text);
      break;
-    case 'SPEAK':
-      speak(msg.text);
-      break;
+    case 'SPEAK_SENTENCE':
+     currentUserBubble = null;
+     appendAiSentence(msg.text, msg.is_first);
+     break;
     case 'AUDIO_START':
       audioStart();
       break;

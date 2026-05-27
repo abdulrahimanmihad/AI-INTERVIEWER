@@ -296,6 +296,82 @@ async def send_response_for_speech(websocket: WebSocket, session_id: str, text: 
     word_count = len(text.split())
     estimated_seconds = (word_count / 2.5) + 12.0
     asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
+def _split_sentences(text: str) -> list:
+    """Split a reply into sentences for synced text+audio delivery."""
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # merge tiny fragments into the previous sentence
+        if out and len(p) < 12:
+            out[-1] += " " + p
+        else:
+            out.append(p)
+    return out or [text.strip()]
+
+
+async def _pocket_stream_sentence(websocket: WebSocket, session_id: str, sentence: str) -> bool:
+    """Stream ONE sentence's audio. Returns False if barge-in cut it."""
+    try:
+        await websocket.send_json({"type": "AUDIO_START"})
+        async with http_client.stream(
+            "POST", POCKET_TTS_URL,
+            data={"text": sentence, "voice_url": POCKET_TTS_VOICE},
+        ) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(chunk_size=4096):
+                if session_id not in ai_speaking_sessions:
+                    return False
+                if chunk:
+                    await websocket.send_bytes(chunk)
+        return True
+    except Exception as e:
+        log.error(f"[TTS] sentence stream failed: {e}")
+        return True
+
+
+async def stream_reply_synced(websocket: WebSocket, session_id: str, text: str):
+    """
+    SYNCED text+audio. For each sentence: reveal its text, then stream its
+    audio. Sarah's caption grows in step with her voice. The full reply is
+    built up sentence by sentence (fixes the old 'only first sentence text'
+    bug — every sentence's text is sent paired with its audio).
+    """
+    if not text or not text.strip():
+        return
+
+    ai_speaking_sessions.add(session_id)
+    sentences = _split_sentences(text)
+
+    for i, sentence in enumerate(sentences):
+        if session_id not in ai_speaking_sessions:
+            log.info(f"[TTS] barge-in, stopping at sentence {i}")
+            break
+
+        is_first = (i == 0)
+        is_last  = (i == len(sentences) - 1)
+
+        # 1. reveal this sentence's text (paired with its audio)
+        await websocket.send_json({
+            "type":     "SPEAK_SENTENCE",
+            "text":     sentence,
+            "is_first": is_first,
+            "is_last":  is_last,
+        })
+
+        # 2. stream this sentence's audio
+        ok = await _pocket_stream_sentence(websocket, session_id, sentence)
+        if not ok:
+            break
+
+    # signal the whole reply's audio is done -> frontend resumes listening
+    await websocket.send_json({"type": "AUDIO_END"})
+
+    word_count = len(text.split())
+    estimated_seconds = (word_count / 2.5) + 12.0
+    asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
 
 #USED FOR LISTENING
 async def vad_receiver_loop(
@@ -435,7 +511,7 @@ async def vad_receiver_loop(
                 silence_count   = 0
                 speech_count    = 0
                 listening_sent  = False
-                
+
 async def deepgram_receiver_loop(websocket, session_id, audio_queue, stop_event):
     dg = None
 
@@ -816,8 +892,7 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
         state["history"].append({"role": "assistant", "content": ai_text})
         await redis_client.set(session_id, json.dumps(state))
 
-        await websocket.send_json({"type": "AI_REPLY", "text": ai_text})
-        await send_response_for_speech(websocket, session_id, ai_text)
+        await stream_reply_synced(websocket, session_id, ai_text)
 
         if len(state["history"]) > MAX_HISTORY_TURNS:
             slot["summary_task"] = asyncio.create_task(update_summary(session_id))
