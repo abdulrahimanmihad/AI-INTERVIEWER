@@ -294,7 +294,7 @@ async def send_response_for_speech(websocket: WebSocket, session_id: str, text: 
     # failsafe lock release — the real release is the browser's TTS_DONE
     # once playback finishes. This only catches a stuck browser.
     word_count = len(text.split())
-    estimated_seconds = (word_count / 2.5) + 12.0
+    estimated_seconds = (word_count / 2) + 100
     asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
 def _split_sentences(text: str) -> list:
     """Split a reply into sentences for synced text+audio delivery."""
