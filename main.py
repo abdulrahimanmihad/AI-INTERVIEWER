@@ -242,7 +242,7 @@ async def _auto_release_speaking_lock(session_id: str, duration_seconds: float):
     await asyncio.sleep(duration_seconds)
     if session_id in ai_speaking_sessions:
         ai_speaking_sessions.discard(session_id)
-        log.info(f"[STATE] {session_id}: TTS auto-released after {duration_seconds:.1f}s")
+        log.warning(f"[STATE] {session_id}: TTS FAILSAFE fired after {duration_seconds:.1f}s — browser may have crashed or TTS_DONE never arrived")
 
 
 async def send_response_for_speech(websocket: WebSocket, session_id: str, text: str):
@@ -291,11 +291,16 @@ async def send_response_for_speech(websocket: WebSocket, session_id: str, text: 
             pass
         return
 
-    # failsafe lock release — the real release is the browser's TTS_DONE
-    # once playback finishes. This only catches a stuck browser.
     word_count = len(text.split())
-    estimated_seconds = (word_count / 2) + 100
-    asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
+    estimated_seconds = (word_count / 1.5) + 10.0
+    slot = session_tasks.setdefault(session_id, {})
+    old = slot.get("tts_failsafe")
+    if old and not old.done():
+        old.cancel()
+    slot["tts_failsafe"] = asyncio.create_task(
+        _auto_release_speaking_lock(session_id, estimated_seconds)
+    )
+
 def _split_sentences(text: str) -> list:
     """Split a reply into sentences for synced text+audio delivery."""
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
@@ -370,8 +375,14 @@ async def stream_reply_synced(websocket: WebSocket, session_id: str, text: str):
 
     # failsafe lock release (real release is the browser's TTS_DONE)
     word_count = len(text.split())
-    estimated_seconds = (word_count / 2) + 100
-    asyncio.create_task(_auto_release_speaking_lock(session_id, estimated_seconds))
+    estimated_seconds = (word_count / 1.5) + 10.0
+    slot = session_tasks.setdefault(session_id, {})
+    old = slot.get("tts_failsafe")
+    if old and not old.done():
+        old.cancel()
+    slot["tts_failsafe"] = asyncio.create_task(
+        _auto_release_speaking_lock(session_id, estimated_seconds)
+    )
 
     return was_interrupted
 
@@ -422,6 +433,10 @@ async def vad_receiver_loop(
             elif msg_type == "TTS_DONE":
                 ai_speaking_sessions.discard(session_id)
                 verifying_barge_in = False
+                slot = session_tasks.get(session_id, {})
+                fs = slot.get("tts_failsafe")
+                if fs and not fs.done():
+                    fs.cancel()
 
             continue
 
@@ -447,7 +462,7 @@ async def vad_receiver_loop(
             frame_np = np.frombuffer(frame, dtype=np.int16)
             energy = np.abs(frame_np).mean()
 
-            if energy < 200:
+            if energy < 250:
                 is_speech = False
             else:
                 try:
@@ -573,6 +588,12 @@ async def deepgram_receiver_loop(websocket, session_id, audio_queue, stop_event)
                         await audio_queue.put(("interrupt", data.get("spoken_so_far", "")))
                 elif mt == "TTS_DONE":
                     ai_speaking_sessions.discard(session_id)
+                    # browser confirmed playback done — cancel the failsafe so
+                    # it can't fire on a future reply
+                    slot = session_tasks.get(session_id, {})
+                    fs = slot.get("tts_failsafe")
+                    if fs and not fs.done():
+                        fs.cancel()
                 continue
 
             if "bytes" not in message:
@@ -904,78 +925,6 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
         slot["is_responding"] = False
 
 
-async def _commit_and_respond(websocket, session_id, state, full_user_text, turn_number):
-    """
-    Commit the buffer to history, call the LLM, send + speak the reply.
-    Shared by the normal flow and the safety-flush fallback.
-
-    DOUBLE-FIRE GUARD: a synchronous is_responding flag set before any await
-    so the normal path and the safety flush can't both call the LLM (which
-    previously caused a duplicate call and a 429 rate limit).
-    """
-    slot = session_tasks.setdefault(session_id, {})
-    if slot.get("is_responding"):
-        log.info("[GUARD] Already responding — skipping duplicate LLM call")
-        return
-    slot["is_responding"] = True
-
-    try:
-        # Re-read state fresh, double-check buffer still present
-        raw = await redis_client.get(session_id)
-        if not raw:
-            return
-        state = json.loads(raw)
-        full_user_text = state.get("turn_buffer", "").strip()
-        if not full_user_text:
-            return  # someone already committed this turn
-
-        state["history"].append({"role": "user", "content": full_user_text})
-        state["turn_buffer"] = ""
-        await redis_client.set(session_id, json.dumps(state))
-
-        await websocket.send_json({"type": "STATUS", "message": "thinking"})
-
-        recent_history = state["history"][-(MAX_HISTORY_TURNS * 2):]
-
-        accumulated = state.get("accumulated_seconds", 0)
-        time_remaining = max(0, INTERVIEW_DURATION_SECONDS - accumulated)
-
-        with track_turn(session_id, turn_number) as log_metrics:
-            result = await run_turn(
-                user_text=full_user_text,
-                history=recent_history,
-                summary=state.get("summary", ""),
-                time_remaining=time_remaining,
-            )
-            log_metrics.metrics(
-                tokens=result["tokens_used"],
-                rag_used=result["rag_used"],
-            )
-
-        ai_text     = result["response"]
-        tokens_used = result["tokens_used"]
-        log.info(f"[TURN {turn_number}] reply='{ai_text[:60]}...'")
-
-        state["tokens_total"] = state.get("tokens_total", 0) + tokens_used
-        await redis_client.set(session_id, json.dumps(state))
-
-        # stream reply (synced sentence text + audio); returns True if barge-in cut it
-        was_interrupted = await stream_reply_synced(websocket, session_id, ai_text)
-
-        # persist assistant turn
-        raw = await redis_client.get(session_id)
-        state = json.loads(raw)
-        state["history"].append({"role": "assistant", "content": ai_text})
-        await redis_client.set(session_id, json.dumps(state))
-
-        # spawn summary ONLY on complete replies — avoids parallel LLM call
-        # on barged-in turns and prevents summary from reflecting cut speech
-        if not was_interrupted and len(state["history"]) > MAX_HISTORY_TURNS:
-            slot["summary_task"] = asyncio.create_task(update_summary(session_id))
-
-    finally:
-        slot["is_responding"] = False
-
 async def _commit_text_turn(websocket, session_id, text, turn_number):
     """
     Deepgram path: Flux finalized a turn. 
@@ -993,7 +942,8 @@ async def _commit_text_turn(websocket, session_id, text, turn_number):
     state["turn_buffer"] = full_user_text
     await redis_client.set(session_id, json.dumps(state))
     await websocket.send_json({"type": "TRANSCRIPT", "text": full_user_text})
-
+     # update UI immediately so it leaves 'listening' the moment EndOfTurn fires
+    await websocket.send_json({"type": "STATUS", "message": "thinking"})   
     # --- CHANGED: Instantly call the response handler instead of scheduling a flush ---
     await _commit_and_respond(
         websocket=websocket, 
@@ -1025,7 +975,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
 
     if session_id:
         if session_id in session_tasks:
-            for key in ("summary_task", "timer_task", "llm_task", "safety_flush"):
+            for key in ("summary_task", "timer_task", "llm_task", "safety_flush", "tts_failsafe"):
                 old_task = session_tasks[session_id].get(key)
                 if old_task and not old_task.done():
                     old_task.cancel()
@@ -1113,7 +1063,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
         log.error(f"[WS] Crash: {e}", exc_info=True)
     finally:
         stop_event.set()
-        for key in ("summary_task", "timer_task", "llm_task", "safety_flush", "dg_flush"):
+        for key in ("summary_task", "timer_task", "llm_task", "safety_flush", "tts_failsafe"):
             task = session_tasks.get(session_id, {}).get(key)
             if task and not task.done():
                 task.cancel()
