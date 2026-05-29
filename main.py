@@ -115,7 +115,7 @@ def _whisper_transcribe(audio_bytes: bytes) -> str:
 
     # Energy gate BEFORE the API call — don't pay to transcribe silence
     avg_energy = np.abs(audio_int16).mean()
-    if avg_energy < 300:
+    if avg_energy < 350:
         log.info(f"[STT] Skipping low-energy audio (energy={avg_energy:.0f})")
         return ""
 
@@ -152,7 +152,7 @@ def _whisper_transcribe(audio_bytes: bytes) -> str:
         def _no_speech(s):
             return s.get("no_speech_prob", 0) if isinstance(s, dict) else getattr(s, "no_speech_prob", 0)
         avg_no_speech = sum(_no_speech(s) for s in segments) / len(segments)
-        if avg_no_speech > 0.6:
+        if avg_no_speech > 0.5:
             log.info(f"[STT] Hallucination rejected (no_speech_prob={avg_no_speech:.2f}): '{text}'")
             return ""
 
@@ -210,7 +210,7 @@ def _is_thought_complete(text: str) -> bool:
         "while", "since", "if", "when", "as", "which", "who",
         "the", "a", "an", "my", "our", "their", "his", "her", "its",
         "to", "of", "for", "in", "on", "at", "with", "from", "by", "about",
-        "i", "we", "they", "he", "she", "you",
+        "i", "we", "they", "he", "she",
         "is", "are", "was", "were", "will", "would", "can", "could", "should",
         "like", "really", "very", "just", "also", "then", "actually",
         "um", "uh", "er", "basically", "kind", "sort", "such" ,"ehh" ,"mm"
@@ -789,7 +789,7 @@ async def process_turn(
         grace = 2 if not thought_complete else 0.5
         _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace)
         return
-
+    '''
     if not thought_complete:
         # Quiet right now, but the sentence trails off mid-thought — the user
         # is likely just pausing to think. Hold briefly and let them continue
@@ -797,9 +797,10 @@ async def process_turn(
         log.info(f"[ENDPOINT] Incomplete thought, waiting for continuation: '{full_user_text[:50]}...'")
         _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, 2)
         return
-
+    '''
     # Quiet AND the thought sounds complete -> respond immediately
     log.info(f"[ENDPOINT] Complete thought, responding now: '{full_user_text[:50]}...'")
+    await websocket.send_json({"type": "STATUS", "message": "thinking"}) 
     await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
 
 
@@ -841,7 +842,7 @@ async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_qu
         full_user_text = state.get("turn_buffer", "").strip()
         if not full_user_text:
             return  # buffer already flushed by normal flow
-
+        await websocket.send_json({"type": "STATUS", "message": "thinking"}) 
         log.info(f"[SAFETY] Flushing buffer after {grace}s quiet: '{full_user_text[:50]}...'")
         await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
 

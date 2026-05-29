@@ -668,6 +668,7 @@ async function setupAudio() {
 
       // 800 is a reasonable threshold for "someone speaking close to mic"
       // Tune this if too sensitive (lower) or not sensitive enough (higher)
+      // vad stable=1600 & deepgram syable =1300
       if (avgEnergy > 1300) {
         speechFrameCount++;
         // Need 3 consecutive loud frames to trigger (~90ms) — avoids false positives
