@@ -124,18 +124,49 @@ async def generate_node(state: GraphState) -> GraphState:
     secs_left = secs % 60
 
     if secs <= 60:
-        time_note = (f"Only {secs} seconds remain. Give a brief warm closing "
-                     "statement and thank the candidate. Do not ask new questions.")
+        time_note = (
+            f"CLOSE PHASE — only {secs} seconds remain. If candidate hasn't "
+            "been asked yet, ask: 'Before we wrap up, do you have any "
+            "questions for me about the role or team?' Keep offering "
+            "('Anything else?') until they clearly signal they're done — "
+            "only then end with [INTERVIEW_DONE]."
+        )
     elif secs <= 120:
-        time_note = (f"About {mins_left}m {secs_left}s remain. Wind down — invite "
-                     "the candidate to ask YOU any questions about the role or team.")
-    elif secs <= 180:
-        time_note = (f"About {mins_left}m {secs_left}s remain. Start moving toward "
-                     "closing topics; ask one final substantive question.")
+        time_note = (
+            f"CLOSE PHASE — about {mins_left}m {secs_left}s remain. Begin "
+            "wrap-up: ask if candidate has any questions for you. Do NOT use "
+            "[INTERVIEW_DONE] yet — wait for their explicit ending signal."
+        )
+    elif secs <= 240:
+        time_note = (
+            f"DEPTH PROBING phase — about {mins_left}m {secs_left}s remain. "
+            "NOT in close phase yet. Ask one focused technical question "
+            "grounded in something the candidate has mentioned. If candidate "
+            "says something warm/friendly, reciprocate briefly and ask the "
+            "next question — do NOT ask 'any questions for me?'."
+        )
+    elif secs <= 480:
+        time_note = (
+            f"ACTIVE FOLLOW-UP phase — about {mins_left}m {secs_left}s remain. "
+            "NOT in close phase. Pick up on specifics the candidate mentions "
+            "and probe deeper. If candidate says warm things like 'great to "
+            "talk with you', reciprocate briefly ('I'm enjoying it too') and "
+            "then ask the NEXT interview question. Never ask 'any questions "
+            "for me?' yet."
+        )
+    elif secs >= 540:
+        time_note = (
+            "LOGISTICAL SCREENING phase — interview just starting. NOT in "
+            "close phase. Ask one quick confirmational question about "
+            "location, hybrid/remote, notice period, or work authorization "
+            "using JOB CONTEXT specifics if present."
+        )
     else:
-        time_note = (f"About {mins_left} minutes remain. Ask focused questions and, "
-                     "when the candidate gives a strong technical answer, ask a "
-                     "follow-up that probes deeper into that specific area.")
+        time_note = (
+            f"About {mins_left} minutes remain. NOT in close phase. Open-"
+            "ended questions with active follow-up. Use a short validation "
+            "phrase before each question."
+        )
 
     system_content = SYSTEM_PROMPT.format(
         rag_context=state["rag_context"] or "(No specific context.)",

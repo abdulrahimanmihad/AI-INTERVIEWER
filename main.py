@@ -717,10 +717,27 @@ async def update_summary(session_id: str):
 
     recent_buffer = state["history"][-(MAX_HISTORY_TURNS * 2):]
     prompt = (
-        f"Update the rolling interview summary in 2-3 sentences.\n"
-        f"Previous summary: {state['summary']}\n"
-        f"Recent turns: {json.dumps(recent_buffer)}\n"
-        f"Include: topics covered, candidate's strength areas, any red flags."
+        "Update the rolling interview summary in 2-3 sentences. STRICTLY "
+        "FACTUAL — capture ONLY:\n"
+        "  • Topics covered (e.g., 'ML libraries', 'XGBoost project', "
+        "    'feature engineering')\n"
+        "  • Specific technologies, tools, or projects the candidate "
+        "    mentioned\n"
+        "  • Concrete strengths demonstrated (with specifics, not feelings)\n"
+        "  • Any factual red flags (e.g., 'unable to explain bias-variance')\n"
+        "\n"
+        "DO NOT include:\n"
+        "  • The candidate's tone, mood, or warmth\n"
+        "  • Phrases like 'enjoyed the conversation', 'good rapport', "
+        "    'positive interaction', 'winding down', 'wrapping up', "
+        "    'engagement', 'ready to close', 'near the end'\n"
+        "  • Any interpretation about whether the interview is concluding\n"
+        "  • Any mention of pleasantries or social remarks the candidate made\n"
+        "\n"
+        f"Previous summary:\n{state['summary']}\n\n"
+        f"Recent turns:\n{json.dumps(recent_buffer)}\n\n"
+        "Write the updated factual summary now (2-3 sentences, topics and "
+        "facts only):"
     )
 
     try:
@@ -909,6 +926,30 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
         await redis_client.set(session_id, json.dumps(state))
 
         # stream reply (synced sentence text + audio); returns True if barge-in cut it
+        interview_done = result.get("interview_done", False)
+        if interview_done:
+            if time_remaining > 120:
+                log.warning(
+                    f"[GUARD] LLM tried [INTERVIEW_DONE] with {time_remaining}s "
+                    "left (need ≤120s) — ignored, interview continues"
+                )
+                interview_done = False
+            else:
+                user_last = full_user_text.lower().strip(" .!?,")
+                END_SIGNALS = (
+                    "no more questions", "no, i'm good", "no i'm good",
+                    "no questions", "we can wrap up", "i'm done", "im done",
+                    "that's all", "thats all", "nothing else", "all set",
+                    "no thanks", "no thank you", "nope", "no thats it",
+                    "i think we can end", "let's end", "lets end",
+                    "nothing more", "i have no questions",
+                )
+                if not any(sig in user_last for sig in END_SIGNALS):
+                    log.warning(
+                        f"[GUARD] LLM tried [INTERVIEW_DONE] but candidate said "
+                        f"'{user_last[:60]}' — no explicit end signal — ignored"
+                    )
+                    interview_done = False
         was_interrupted = await stream_reply_synced(websocket, session_id, ai_text)
 
         # persist assistant turn
@@ -916,6 +957,10 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
         state = json.loads(raw)
         state["history"].append({"role": "assistant", "content": ai_text})
         await redis_client.set(session_id, json.dumps(state))
+        if interview_done:
+            log.info(f"[TURN {turn_number}] candidate ended the interview cleanly")
+            await end_interview_now(websocket, session_id)
+            return
 
         # spawn summary ONLY on complete replies — avoids parallel LLM call
         # on barged-in turns and prevents summary from reflecting cut speech
@@ -1082,30 +1127,51 @@ async def interview_timer(
     session_id: str,
     stop_event: asyncio.Event,
 ):
+    """
+    Wall-clock anchored timer. Computes remaining from a stored unix
+    timestamp, so it can NEVER drift regardless of loop overhead, Redis
+    latency, or any async hiccup.
+    """
+    # initialize start timestamp once
+    raw = await redis_client.get(session_id)
+    if not raw:
+        return
+    state = json.loads(raw)
+    if not state.get("interview_started_at"):
+        # if resuming, back-date the start by however much was already accumulated
+        already_elapsed = state.get("accumulated_seconds", 0)
+        state["interview_started_at"] = time.time() - already_elapsed
+        await redis_client.set(session_id, json.dumps(state))
+
     while not stop_event.is_set():
         raw = await redis_client.get(session_id)
         if not raw:
             return
-
         state = json.loads(raw)
-        accumulated = state.get("accumulated_seconds", 0)
-        remaining   = INTERVIEW_DURATION_SECONDS - accumulated
+
+        started_at = state.get("interview_started_at") or time.time()
+        elapsed   = time.time() - started_at
+        remaining = max(0, int(INTERVIEW_DURATION_SECONDS - elapsed))
+
+        # keep accumulated_seconds in sync for resume / persistence
+        state["accumulated_seconds"] = int(elapsed)
 
         await websocket.send_json({
             "type":      "TIMER_TICK",
-            "remaining": int(remaining),
-            "elapsed":   int(accumulated),
+            "remaining": remaining,
+            "elapsed":   int(elapsed),
             "total":     INTERVIEW_DURATION_SECONDS,
         })
 
         if not state.get("warning_sent") and 0 < remaining <= INTERVIEW_WARNING_SECONDS:
             state["warning_sent"] = True
-            await redis_client.set(session_id, json.dumps(state))
             await websocket.send_json({
                 "type":    "TIMER_WARNING",
                 "message": f"{INTERVIEW_WARNING_SECONDS} seconds remaining",
             })
             log.info(f"[TIMER] {session_id}: 1 minute warning")
+
+        await redis_client.set(session_id, json.dumps(state))
 
         if remaining <= 0:
             log.info(f"[TIMER] {session_id}: time expired")
@@ -1118,13 +1184,6 @@ async def interview_timer(
             return
         except asyncio.TimeoutError:
             pass
-
-        raw = await redis_client.get(session_id)
-        if not raw:
-            return
-        state = json.loads(raw)
-        state["accumulated_seconds"] = state.get("accumulated_seconds", 0) + 1
-        await redis_client.set(session_id, json.dumps(state))
 
 
 async def end_interview_now(websocket: WebSocket, session_id: str):
@@ -1165,6 +1224,7 @@ def _new_state() -> dict:
         "previous_summary":    "",
         "tokens_total":        0,
         "status":              "IN_PROGRESS",
+        "interview_started_at": 0,   # ← NEW: unix timestamp when timer first ticked
         "accumulated_seconds": 0,
         "warning_sent":        False,
         "pending_user_text":   "",
