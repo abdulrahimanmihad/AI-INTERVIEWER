@@ -811,7 +811,7 @@ async def process_turn(
     if is_speaking or not audio_queue.empty():
         log.info(f"[HOLD] User still speaking. Holding: '{full_user_text[:50]}...'")
         # incomplete thought -> wait longer; complete -> short safety net
-        grace = 2 if not thought_complete else 1
+        grace = 0.7 if not thought_complete else 1
         _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace)
         return
     
@@ -829,7 +829,7 @@ async def process_turn(
     await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
 
 
-def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=1):
+def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=0.7):
     """
     Cancel any existing safety-flush task and schedule a new one.
     `grace` is set by the caller based on semantic completeness — a longer
@@ -844,7 +844,7 @@ def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio
     )
 
 
-async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=1):
+async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=0.7):
     """
     Wait `grace` seconds. If still quiet (not speaking, queue empty) and
     a buffer is waiting, fire the LLM. Prevents a held buffer from being
