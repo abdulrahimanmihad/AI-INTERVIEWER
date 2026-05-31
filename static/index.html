@@ -126,10 +126,11 @@
 
   <div id="interview-section" class="hidden">
     <!-- ADDED: live timer countdown display -->
-    <div id="timer" class="timer">10:00</div>
+    <div id="timer" class="timer hidden">10:00</div>
     <div id="status" class="status">Connecting...</div>
     <div id="transcript" class="transcript"></div>
     <button id="stop-btn" class="danger hidden">End Interview</button>
+    <button id="end-interview-btn" class="danger hidden">End Interview (Q&A time)</button>
   </div>
 </div>
 
@@ -167,7 +168,6 @@ let audioContext = null;
 let mediaStream  = null;
 let workletNode  = null;
 let selectedVoice = null;
-
 let currentAiBubble = null;
 let pendingSentence = null;     // {words, bubbleSpan} waiting for its audio duration
 let wordRevealTimer = null;
@@ -362,8 +362,10 @@ function stopStreamPlayback() {
 
 // ─── ADDED: STOP TTS PLAYBACK (called when backend confirms interrupt) ──
 function stopSpeaking() {
-  revealStopped = true;                               // ← stops any in-flight reveal
+  revealStopped = true;
   if (wordRevealTimer) { clearTimeout(wordRevealTimer); wordRevealTimer = null; }
+  pendingRevealWords = null;
+  pendingRevealIndex = 0;
   stopStreamPlayback();
   window.speechSynthesis.cancel();
   currentUtterance = null;
@@ -383,40 +385,54 @@ function addTurn(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
+let pendingRevealWords = null;
+let pendingRevealIndex = 0;
+
 function queueSentenceForReveal(text, isFirst) {
+  // Cancel any in-flight reveal from the previous sentence — but flush its
+  // remaining words first so we don't lose any text.
+  if (wordRevealTimer) {
+    clearTimeout(wordRevealTimer);
+    wordRevealTimer = null;
+    if (currentAiBubble && pendingRevealWords && pendingRevealIndex < pendingRevealWords.length) {
+      const bubble = currentAiBubble.querySelector('.bubble-text');
+      const leftover = pendingRevealWords.slice(pendingRevealIndex).join(" ");
+      const sep = (bubble.textContent && !bubble.textContent.endsWith(" ")) ? " " : "";
+      bubble.textContent += sep + leftover;
+    }
+  }
+  pendingRevealWords = null;
+  pendingRevealIndex = 0;
+  revealStopped = false;
+
   if (isFirst || !currentAiBubble) {
-    revealStopped = false;                            // ← new reply, allow reveal again
     const div = document.createElement('div');
     div.className = 'turn ai';
     div.innerHTML = `<div class="role">Sarah</div><div class="bubble-text"></div>`;
     transcriptEl.appendChild(div);
     currentAiBubble = div;
   }
-  // ... rest unchanged
   const bubble = currentAiBubble.querySelector('.bubble-text');
-
-  // append a space if the bubble already has text
-  const prefix = bubble.textContent ? " " : "";
+  const prefix = (bubble.textContent && !bubble.textContent.endsWith(" ")) ? " " : "";
   const words = text.split(/\s+/).filter(Boolean);
-
-  // store this sentence; the audio handler will trigger the timed reveal
-  // once it knows the duration. We reveal immediately at an estimated pace
-  // and let the audio duration correct it.
   revealWordsProgressively(bubble, prefix, words);
 }
 
-let revealStopped = false;
-
 function revealWordsProgressively(bubble, prefix, words, durationMs) {
-  const perWord = durationMs ? (durationMs / words.length) : 380;
-  let i = 0;
+  const perWord = durationMs ? (durationMs / words.length) : 280;
+  pendingRevealWords = words;
+  pendingRevealIndex = 0;
   if (prefix) bubble.textContent += prefix;
 
   function step() {
-    if (revealStopped || i >= words.length) return;   // ← check flag
-    bubble.textContent += (i > 0 ? " " : "") + words[i];
+    if (revealStopped || pendingRevealIndex >= words.length) {
+      pendingRevealWords = null;
+      pendingRevealIndex = 0;
+      return;
+    }
+    bubble.textContent += (pendingRevealIndex > 0 ? " " : "") + words[pendingRevealIndex];
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
-    i++;
+    pendingRevealIndex++;
     wordRevealTimer = setTimeout(step, perWord);
   }
   step();
@@ -496,10 +512,21 @@ stopBtn.addEventListener('click', () => {
   stopBtn.classList.add('hidden');
 });
 
+const endInterviewBtn = document.getElementById('end-interview-btn');
+
+if (endInterviewBtn) {
+  endInterviewBtn.addEventListener('click', () => {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "END_INTERVIEW" }));
+    }
+    endInterviewBtn.classList.add('hidden');
+  });
+}
+
 // ─── WEBSOCKET ────────────────────────────────────────────────────
 async function connectAndStart(name, email) {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/ws?name=${encodeURIComponent(name)}&email=${encodeURIComponent(email)}`;
+  const wsUrl = `${protocol}//${window.location.host}/ws?name=${encodeURIComponent(name)}&email=${encodeURIComponent(email)}&company_id=default`;
   socket = new WebSocket(wsUrl);
 
   socket.onopen = async () => {
@@ -593,6 +620,12 @@ function handleMessage(msg) {
     case 'AUDIO_END':
       audioEnd();
       break;
+    case 'QUESTIONS_DONE':
+      endInterviewBtn.classList.remove('hidden');
+      timerEl.classList.remove('hidden');
+      timerEl.textContent = '05:00';
+      setStatus('All questions done — you may ask Sarah or end the interview', 'speaking');
+      break;
     case 'RESUME':
       addTurn('ai', msg.message);
       setStatus(msg.message, 'speaking');
@@ -650,7 +683,7 @@ async function setupAudio() {
   const source = audioContext.createMediaStreamSource(mediaStream);
   workletNode  = new AudioWorkletNode(audioContext, 'pcm-processor');
 
-  workletNode.port.onmessage = (event) => {
+  workletNode.port.onmessage = (event) => { 
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
 
     // ─── ADDED: BARGE-IN / INTERRUPT DETECTION ────────────────────
@@ -669,7 +702,7 @@ async function setupAudio() {
       // 800 is a reasonable threshold for "someone speaking close to mic"
       // Tune this if too sensitive (lower) or not sensitive enough (higher)
       // vad stable=1600 & deepgram syable =1300
-      if (avgEnergy > 1300) {
+      if (avgEnergy > 1600) {
         speechFrameCount++;
         // Need 3 consecutive loud frames to trigger (~90ms) — avoids false positives
         if (speechFrameCount >= 3) {

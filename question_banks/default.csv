@@ -1,0 +1,11 @@
+question,category,role,follow_up
+"could you tell me about your current role and what you work on day to day?",background,ml_engineer,"Could you give me an example of a typical project?"
+"Walk me through the ML libraries and frameworks you've used most in your work.",technical,ml_engineer,"Which one do you reach for first and why?"
+"Tell me about a recent machine learning project you're proud of.",technical,ml_engineer,"What made the data particularly challenging?"
+"How do you typically approach feature selection on a new dataset?",technical,ml_engineer,"Can you give a specific example from a project?"
+"Explain in your own words what the curse of dimensionality means and when you've run into it.",technical,ml_engineer,"How did you address it?"
+"How do you decide whether your model is actually performing well — what metrics do you use?",technical,ml_engineer,"Why those metrics for that problem?"
+"Describe a time when a model worked well in development but failed in production. What went wrong?",behavioral,*,"What would you do differently next time?"
+"How comfortable are you with deploying ML models, and what does your typical deployment workflow look like?",technical,ml_engineer,"What monitoring do you set up after deployment?"
+"Tell me about a time you had to explain a complex technical concept to a non-technical stakeholder.",behavioral,*,"How did they respond?"
+"What are you looking for in your next role, and why does this opportunity stand out to you?",motivation,*,"Anything specific about our company that drew you in?"

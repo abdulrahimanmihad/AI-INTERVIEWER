@@ -152,7 +152,7 @@ def _whisper_transcribe(audio_bytes: bytes) -> str:
         def _no_speech(s):
             return s.get("no_speech_prob", 0) if isinstance(s, dict) else getattr(s, "no_speech_prob", 0)
         avg_no_speech = sum(_no_speech(s) for s in segments) / len(segments)
-        if avg_no_speech > 0.5:
+        if avg_no_speech > 1:
             log.info(f"[STT] Hallucination rejected (no_speech_prob={avg_no_speech:.2f}): '{text}'")
             return ""
 
@@ -437,6 +437,10 @@ async def vad_receiver_loop(
                 fs = slot.get("tts_failsafe")
                 if fs and not fs.done():
                     fs.cancel()
+            elif msg_type == "END_INTERVIEW":
+                    log.info(f"[USER] Candidate clicked End Interview")
+                    await end_interview_now(websocket, session_id)
+                    return
 
             continue
 
@@ -594,6 +598,10 @@ async def deepgram_receiver_loop(websocket, session_id, audio_queue, stop_event)
                     fs = slot.get("tts_failsafe")
                     if fs and not fs.done():
                         fs.cancel()
+                elif mt == "END_INTERVIEW":
+                    log.info(f"[USER] Candidate clicked End Interview")
+                    await end_interview_now(websocket, session_id)
+                    return
                 continue
 
             if "bytes" not in message:
@@ -803,10 +811,10 @@ async def process_turn(
     if is_speaking or not audio_queue.empty():
         log.info(f"[HOLD] User still speaking. Holding: '{full_user_text[:50]}...'")
         # incomplete thought -> wait longer; complete -> short safety net
-        grace = 2 if not thought_complete else 0.5
+        grace = 2 if not thought_complete else 1
         _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace)
         return
-    '''
+    
     if not thought_complete:
         # Quiet right now, but the sentence trails off mid-thought — the user
         # is likely just pausing to think. Hold briefly and let them continue
@@ -814,14 +822,14 @@ async def process_turn(
         log.info(f"[ENDPOINT] Incomplete thought, waiting for continuation: '{full_user_text[:50]}...'")
         _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, 2)
         return
-    '''
+    
     # Quiet AND the thought sounds complete -> respond immediately
     log.info(f"[ENDPOINT] Complete thought, responding now: '{full_user_text[:50]}...'")
     await websocket.send_json({"type": "STATUS", "message": "thinking"}) 
     await _commit_and_respond(websocket, session_id, state, full_user_text, turn_number)
 
 
-def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=0.5):
+def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=1):
     """
     Cancel any existing safety-flush task and schedule a new one.
     `grace` is set by the caller based on semantic completeness — a longer
@@ -836,7 +844,7 @@ def _schedule_safety_flush(websocket, session_id, stop_event, turn_number, audio
     )
 
 
-async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=0.5):
+async def _safety_flush(websocket, session_id, stop_event, turn_number, audio_queue, grace=1):
     """
     Wait `grace` seconds. If still quiet (not speaking, queue empty) and
     a buffer is waiting, fire the LLM. Prevents a held buffer from being
@@ -906,12 +914,25 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
         accumulated = state.get("accumulated_seconds", 0)
         time_remaining = max(0, INTERVIEW_DURATION_SECONDS - accumulated)
 
+        # ── prebuilt-mode kwargs (other modes ignore them via **kwargs) ──
+        prebuilt_kwargs = {}
+        if RAG_METHOD == "prebuilt":
+            prebuilt_kwargs = {
+                "company_id":         state.get("company_id", "default"),
+                "asked_question_ids": state.get("asked_question_ids", []),
+                "awaiting_followup":  state.get("awaiting_followup", False),
+                "all_questions_done": state.get("all_questions_done", False),
+            }
+        if RAG_METHOD == "prebuilt":
+            log.info(f"[PREBUILT DEBUG] asked_question_ids before turn: {state.get('asked_question_ids', [])}")
+        
         with track_turn(session_id, turn_number) as log_metrics:
             result = await run_turn(
                 user_text=full_user_text,
                 history=recent_history,
                 summary=state.get("summary", ""),
                 time_remaining=time_remaining,
+                **prebuilt_kwargs,
             )
             log_metrics.metrics(
                 tokens=result["tokens_used"],
@@ -919,13 +940,29 @@ async def _commit_and_respond(websocket, session_id, state, full_user_text, turn
             )
 
         ai_text     = result["response"]
+        if RAG_METHOD == "prebuilt":
+            log.info(f"[PREBUILT DEBUG] next_question_id from result: {result.get('next_question_id')}")
+            log.info(f"[PREBUILT DEBUG] all_questions_done from result: {result.get('all_questions_done')}")
+            log.info(f"[PREBUILT DEBUG] followup_asked from result: {result.get('followup_asked')}")
         tokens_used = result["tokens_used"]
         log.info(f"[TURN {turn_number}] reply='{ai_text[:60]}...'")
-
+        if RAG_METHOD == "prebuilt":
+            qid = result.get("next_question_id")
+            if qid and qid not in state["asked_question_ids"] and not result.get("followup_asked"):
+                state["asked_question_ids"].append(qid)
+            state["awaiting_followup"] = bool(result.get("followup_asked"))
+            just_exhausted = result.get("all_questions_done") and not state["all_questions_done"]
+            if just_exhausted:
+                state["all_questions_done"] = True
+                state["qa_phase_started_at"] = time.time()
+                await websocket.send_json({"type": "QUESTIONS_DONE"})
+                log.info(f"[PREBUILT] Bank exhausted — Q&A phase begins, 5-min cap started")
+        
         state["tokens_total"] = state.get("tokens_total", 0) + tokens_used
         await redis_client.set(session_id, json.dumps(state))
 
         # stream reply (synced sentence text + audio); returns True if barge-in cut it
+        
         interview_done = result.get("interview_done", False)
         if interview_done:
             if time_remaining > 120:
@@ -1002,7 +1039,7 @@ async def _commit_text_turn(websocket, session_id, text, turn_number):
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = ""):
+async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = "",company_id: str = "default"): # ← NEW
     if not email:
         await websocket.accept()
         await websocket.send_json({"type": "ERROR", "message": "Email required"})
@@ -1038,10 +1075,12 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
             log.info(f"[RESUME] {email} reconnected — restoring {len(state['history'])} turns")
         else:
             state = _new_state()
+            state["company_id"] = company_id
             await redis_client.set(session_id, json.dumps(state))
     else:
         session_id = await register_new_user(name or "Anonymous", email)
         state      = _new_state()
+        state["company_id"] = company_id
         await redis_client.set(session_id, json.dumps(state))
 
     defaults = _new_state()
@@ -1058,7 +1097,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "", email: str = 
 
     if not state["history"]:
         opening = (f"Hi {name or 'there'}, I'm Sarah. Thanks for taking the time today. "
-                   f"To start could you walk me through your background and what drew you to this role?")
+                   )
         state["history"].append({"role": "assistant", "content": opening})
         await redis_client.set(session_id, json.dumps(state))
         await asyncio.sleep(0.2)
@@ -1128,17 +1167,17 @@ async def interview_timer(
     stop_event: asyncio.Event,
 ):
     """
-    Wall-clock anchored timer. Computes remaining from a stored unix
-    timestamp, so it can NEVER drift regardless of loop overhead, Redis
-    latency, or any async hiccup.
+    Mode-aware timer.
+      - Prebuilt mode: NO overall countdown. Only enforces a 5-minute cap
+        AFTER all bank questions are done (Q&A phase begins).
+      - Other modes: 10-minute wall-clock countdown.
     """
-    # initialize start timestamp once
+    # initialize start time once (used by non-prebuilt modes)
     raw = await redis_client.get(session_id)
     if not raw:
         return
     state = json.loads(raw)
     if not state.get("interview_started_at"):
-        # if resuming, back-date the start by however much was already accumulated
         already_elapsed = state.get("accumulated_seconds", 0)
         state["interview_started_at"] = time.time() - already_elapsed
         await redis_client.set(session_id, json.dumps(state))
@@ -1149,11 +1188,36 @@ async def interview_timer(
             return
         state = json.loads(raw)
 
-        started_at = state.get("interview_started_at") or time.time()
-        elapsed   = time.time() - started_at
-        remaining = max(0, int(INTERVIEW_DURATION_SECONDS - elapsed))
+        # ───── PREBUILT MODE: 5-min Q&A cap only ─────
+        if RAG_METHOD == "prebuilt":
+            qa_started = state.get("qa_phase_started_at", 0)
+            if qa_started:
+                qa_elapsed   = time.time() - qa_started
+                qa_remaining = max(0, 300 - int(qa_elapsed))
+                await websocket.send_json({
+                    "type":      "TIMER_TICK",
+                    "remaining": qa_remaining,
+                    "elapsed":   int(qa_elapsed),
+                    "total":     300,
+                })
+                if qa_remaining <= 0:
+                    log.info(f"[PREBUILT] Q&A 5-min cap expired — ending interview")
+                    await end_interview_now(websocket, session_id)
+                    stop_event.set()
+                    return
+            # before Q&A phase: silent — no ticks, no countdown
 
-        # keep accumulated_seconds in sync for resume / persistence
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                return
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        # ───── NON-PREBUILT MODES: 10-minute wall-clock countdown ─────
+        started_at = state.get("interview_started_at") or time.time()
+        elapsed    = time.time() - started_at
+        remaining  = max(0, int(INTERVIEW_DURATION_SECONDS - elapsed))
         state["accumulated_seconds"] = int(elapsed)
 
         await websocket.send_json({
@@ -1230,6 +1294,12 @@ def _new_state() -> dict:
         "pending_user_text":   "",
         "last_user_msg_time":  0,
         "turn_buffer":         "",
+        # ── prebuilt-mode fields ──
+        "company_id":          "default",   # set per session at start
+        "asked_question_ids":  [],
+        "awaiting_followup":   False,
+        "all_questions_done":  False,
+        "qa_phase_started_at": 0,           # unix timestamp when Q&A began
     }
 
 

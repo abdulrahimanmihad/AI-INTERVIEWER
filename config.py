@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # THE TWO MAIN SWITCHES
-RAG_METHOD: str = os.getenv("RAG_METHOD", "agentic")
+RAG_METHOD: str = os.getenv("RAG_METHOD", "langgraph")
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")
 
 POCKET_TTS_URL: str   = os.getenv("POCKET_TTS_URL", "http://localhost:8001/tts")

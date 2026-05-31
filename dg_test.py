@@ -13,7 +13,7 @@ async def main():
             model="flux-general-en",
             encoding="linear16",
             sample_rate=16000,
-            eot_threshold=0.7,
+            eot_threshold=0.2,
         ) as conn:
             print("CONNECTED to Flux OK")
             conn.on(EventType.MESSAGE, lambda m: print("msg:", getattr(m, "type", "?")))

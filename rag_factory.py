@@ -1,6 +1,10 @@
 from config import RAG_METHOD
 
-if RAG_METHOD == "classic":
+
+if RAG_METHOD == "prebuilt":
+    from rag_methods.prebuilt_rag import run_turn 
+    print(f"[RAG FACTORY] Using prebuilt RAG")
+elif RAG_METHOD == "classic":
     from rag_methods.classic_rag import run_turn
     print(f"[RAG FACTORY] Using CLASSIC RAG")
 
